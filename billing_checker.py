@@ -1,16 +1,8 @@
 # app.py — HiRasmus (actual) vs Aloha (billing) checker
-# Spec (final, with Service Name filter):
-# - File 1 (HiRasmus): Status, Duration, User, Session, AlohaABA Appointment ID, Location (start),
-#                      Staff Profile: Full Name (as shown on ID), Client
-# - File 2 (Aloha): Appointment ID, Billing Minutes, Staff Name, Client Name, Appt.Date, Service Name
-#
-# Filters & Checks:
-#   (A) File 2 prefilter → Service Name == "Direct Service BT"
-#   1) Duration in minutes strictly > 60 and < 360
-#   2) Location (start) not blank
-#   3) |DurationMinutes - BillingMinutes| <= 8
-#
-# Output: Excel with All / Clean / Flagged sheets (one sheet per Appt.Date)
+# Changes in this version:
+# - Removed "Activity type" from required File 1 columns (still shown if present).
+# - Output shows only one Appointment ID column: "Appointment ID" (from File 2).
+# - All prior rules remain, incl. File 1 Status filter and Service Name filter on File 2.
 
 import io
 import numpy as np
@@ -18,17 +10,30 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="HiRasmus ↔ Aloha Duration & Billing Check", layout="wide")
-st.title("HiRasmus ↔ Aloha — Duration & Billing Alignment (with Service Filter)")
+st.title("HiRasmus ↔ Aloha — Duration & Billing Alignment (Service + Status filters)")
 
 # ---------- Config ----------
 REQ_FILE1 = [
-    "Status", "Duration", "User", "Session",
-    "AlohaABA Appointment ID", "Location (start)",
-    "Staff Profile: Full Name (as shown on ID)", "Client",
+    "Status",
+    "Client",
+    "Staff Profile: Full Name (as shown on ID)",  # required but hidden in output
+    "Start time",  # required
+    "End time",
+    "Duration",
+    # "Activity type",  # NO LONGER REQUIRED (optional if present)
+    "AlohaABA Appointment ID",
+    "Location (start)",
+    "Location (end)",
+    "User signature location",
+    "Parent signature location",
 ]
+# Note: "Session" intentionally NOT required
+
 REQ_FILE2 = ["Appointment ID", "Billing Minutes", "Staff Name", "Client Name", "Appt. Date", "Service Name"]
 
 SERVICE_REQUIRED = "Direct Service BT"
+STATUS_REQUIRED  = "Transferred to AlohaABA"
+
 BILLING_TOL_MIN = 8
 MIN_MINUTES = 60
 MAX_MINUTES = 360
@@ -41,9 +46,8 @@ def ensure_cols(df: pd.DataFrame, cols, label: str) -> bool:
         return False
     return True
 
-
 def parse_duration_to_minutes(d):
-    """Convert duration string 'HH:MM:SS' → minutes (float)."""
+    """Convert duration 'HH:MM:SS' → minutes (float)."""
     if pd.isna(d):
         return np.nan
     s = str(d).strip()
@@ -61,9 +65,20 @@ def parse_duration_to_minutes(d):
         pass
     return np.nan
 
+def minutes_to_hhmmss_signed(mins: float) -> str:
+    """Format signed minutes → ±HH:MM:SS (negative for under)."""
+    if pd.isna(mins):
+        return ""
+    sign = "-" if mins < 0 else ""
+    secs_total = int(round(abs(mins) * 60))
+    h = secs_total // 3600
+    rem = secs_total % 3600
+    m = rem // 60
+    s = rem % 60
+    return f"{sign}{int(h):02d}:{int(m):02d}:{int(s):02d}"
 
 def export_excel(df: pd.DataFrame) -> bytes:
-    """Export one sheet per Appt.Date."""
+    """Export one sheet per Appt. Date."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
         if "Appt. Date" in df.columns:
@@ -75,7 +90,6 @@ def export_excel(df: pd.DataFrame) -> bytes:
         else:
             df.to_excel(w, index=False, sheet_name="All")
     return buf.getvalue()
-
 
 # ---------- UI ----------
 st.subheader("1) Upload Files")
@@ -101,21 +115,28 @@ for df in (df1, df2):
         if df[c].dtype == object:
             df[c] = df[c].astype(str).str.strip().replace({"nan": np.nan, "": np.nan})
 
-# ---------- Prefilter File 2 ----------
+# ---------- Prefilters ----------
+# File 2: Service filter
 df2_f = df2[df2["Service Name"].astype(str).str.strip() == SERVICE_REQUIRED].copy()
-st.caption(f'Prefilter applied to **File 2**: Service Name == "{SERVICE_REQUIRED}"')
+
+# File 1: Status filter
+df1_f = df1[df1["Status"].astype(str).str.strip() == STATUS_REQUIRED].copy()
+
+st.caption(
+    f'Prefilters → File 2: Service Name == "{SERVICE_REQUIRED}" | '
+    f'File 1: Status == "{STATUS_REQUIRED}"'
+)
 st.write({
-    "File 1 rows": int(df1.shape[0]),
-    "File 2 rows before filter": int(df2.shape[0]),
-    "File 2 rows after filter": int(df2_f.shape[0]),
+    "File 1 rows (before/after)": f"{int(df1.shape[0])} / {int(df1_f.shape[0])}",
+    "File 2 rows (before/after)": f"{int(df2.shape[0])} / {int(df2_f.shape[0])}",
 })
 
 # ---------- Parse Duration ----------
-df1["_ActualMinutes"] = df1["Duration"].apply(parse_duration_to_minutes)
+df1_f["Actual Minutes"] = df1_f["Duration"].apply(parse_duration_to_minutes)
 
 # ---------- Merge ----------
 merged = pd.merge(
-    df1,
+    df1_f,
     df2_f[["Appointment ID", "Billing Minutes", "Staff Name", "Client Name", "Appt. Date", "Service Name"]],
     left_on="AlohaABA Appointment ID",
     right_on="Appointment ID",
@@ -125,16 +146,14 @@ merged = pd.merge(
 # ---------- Convert Billing ----------
 merged["_BillingMinutes"] = pd.to_numeric(merged["Billing Minutes"], errors="coerce")
 
-# ---------- Checks ----------
+# ---------- Checks (internal only; not in output) ----------
 # 1) Duration window
-merged["Check_DurationWindow"] = merged["_ActualMinutes"].apply(
-    lambda m: (not pd.isna(m)) and (m > MIN_MINUTES) and (m < MAX_MINUTES)
-)
+check_duration = merged["Actual Minutes"].apply(lambda m: (not pd.isna(m)) and (m > MIN_MINUTES) and (m < MAX_MINUTES))
 
-# 2) Location present
-merged["Check_LocationPresent"] = merged["Location (start)"].notna() & (
-    merged["Location (start)"].astype(str).str.strip() != ""
-)
+# 2) BOTH locations present
+loc_start_ok = merged["Location (start)"].notna() & (merged["Location (start)"].astype(str).str.strip() != "")
+loc_end_ok   = merged["Location (end)"].notna() & (merged["Location (end)"].astype(str).str.strip() != "")
+check_locations = loc_start_ok & loc_end_ok
 
 # 3) Billing alignment ±8 min
 def bill_align(actual, billing):
@@ -142,49 +161,51 @@ def bill_align(actual, billing):
         return False
     return abs(actual - billing) <= BILLING_TOL_MIN
 
-merged["Check_BillingAlign"] = merged.apply(
-    lambda r: bill_align(r["_ActualMinutes"], r["_BillingMinutes"]), axis=1
-)
+check_billing = merged.apply(lambda r: bill_align(r["Actual Minutes"], r["_BillingMinutes"]), axis=1)
 
-# Overall Pass
-merged["Overall Pass"] = (
-    merged["Check_DurationWindow"]
-    & merged["Check_LocationPresent"]
-    & merged["Check_BillingAlign"]
-)
+merged["_OverallPass"] = check_duration & check_locations & check_billing
 
-# ---------- Display ----------
-show_cols = [
-    "AlohaABA Appointment ID", "Appt. Date", "Service Name", "Client", "Client Name",
-    "Staff Profile: Full Name (as shown on ID)", "Staff Name",
-    "Location (start)", "Duration", "_ActualMinutes",
-    "_BillingMinutes", "Check_DurationWindow",
-    "Check_LocationPresent", "Check_BillingAlign", "Overall Pass",
+# ---------- Computed display fields ----------
+merged["Δ vs Billing (minutes)"] = merged["Actual Minutes"] - merged["_BillingMinutes"]
+merged["Δ vs Billing (HH:MM:SS)"] = merged["Δ vs Billing (minutes)"].apply(minutes_to_hhmmss_signed)
+
+# ---------- Display (only one Appointment ID; hide staff profile name) ----------
+display_cols = [
+    "Status",
+    "Appt. Date",
+    "Appointment ID",
+    "Client",
+    "Staff Name",
+    "Start time",
+    "End time",
+    "Duration",
+    "Location (start)",
+    "Location (end)",
+    "User signature location",
+    "Parent signature location",
+    "Service Name",
+    "Billing Minutes",
+    "Actual Minutes",
+    "Δ vs Billing (HH:MM:SS)",
 ]
-present_cols = [c for c in show_cols if c in merged.columns]
+present_cols = [c for c in display_cols if c in merged.columns]
 
 st.subheader("2) Results")
-st.dataframe(merged[present_cols], use_container_width=True, height=520)
+st.dataframe(merged[present_cols], use_container_width=True, height=560)
 
 # ---------- Summary ----------
+st.caption("Summary")
 summary = pd.DataFrame({
-    "Total": [len(merged)],
-    "Pass": [int(merged["Overall Pass"].sum())],
-    "Fail": [int((~merged["Overall Pass"]).sum())],
+    "Total (after filters)": [len(merged)],
+    "Pass": [int(merged["_OverallPass"].sum())],
+    "Fail": [int((~merged["_OverallPass"]).sum())],
 })
 st.table(summary)
 
-fail_reasons = pd.DataFrame({
-    "Duration out of range": [int((~merged["Check_DurationWindow"]).sum())],
-    "Location missing": [int((~merged["Check_LocationPresent"]).sum())],
-    "Billing misaligned": [int((~merged["Check_BillingAlign"]).sum())],
-})
-st.table(fail_reasons)
-
-# ---------- Export ----------
+# ---------- Export (no boolean columns in files) ----------
 all_df = merged[present_cols].copy()
-clean_df = merged[merged["Overall Pass"]][present_cols].copy()
-flagged_df = merged[~merged["Overall Pass"]][present_cols].copy()
+clean_df = merged[merged["_OverallPass"]][present_cols].copy()
+flagged_df = merged[~merged["_OverallPass"]][present_cols].copy()
 
 xlsx_all = export_excel(all_df)
 xlsx_clean = export_excel(clean_df)
@@ -200,10 +221,11 @@ with c3:
 
 st.caption(
     f"""
-**Checks summary:**
-- File 2 filtered to **Service Name == "{SERVICE_REQUIRED}"**  
-- Duration strictly > {MIN_MINUTES} min and < {MAX_MINUTES} min  
-- Location (start) must not be blank  
-- Duration within ±{BILLING_TOL_MIN} minutes of Billing Minutes  
+**Internal checks (not shown in table):**
+- File 2 filtered to **Service Name == "{SERVICE_REQUIRED}"**
+- File 1 filtered to **Status == "{STATUS_REQUIRED}"**
+- Duration strictly > {MIN_MINUTES} and < {MAX_MINUTES} minutes
+- **Both** Location (start) and Location (end) must have content
+- Billing within ±{BILLING_TOL_MIN} minutes (see signed Δ column)
 """
 )
