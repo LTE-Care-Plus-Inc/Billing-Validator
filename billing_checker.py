@@ -16,18 +16,15 @@ st.title("HiRasmus ↔ Aloha — Duration & Billing Alignment (Service + Status 
 REQ_FILE1 = [
     "Status",
     "Client",
-    "Staff Profile: Full Name (as shown on ID)",  # required but hidden in output
-    "Start time",  # required
+    "Start time",
     "End time",
     "Duration",
-    # "Activity type",  # NO LONGER REQUIRED (optional if present)
     "AlohaABA Appointment ID",
     "Location (start)",
     "Location (end)",
     "User signature location",
     "Parent signature location",
 ]
-# Note: "Session" intentionally NOT required
 
 REQ_FILE2 = ["Appointment ID", "Billing Minutes", "Staff Name", "Client Name", "Appt. Date", "Service Name"]
 
@@ -144,7 +141,7 @@ merged = pd.merge(
 )
 
 # ---------- Convert Billing ----------
-merged["_BillingMinutes"] = pd.to_numeric(merged["Billing Minutes"], errors="coerce")
+merged["Scheduled Minutes"] = pd.to_numeric(merged["Billing Minutes"], errors="coerce")
 
 # ---------- Checks (internal only; not in output) ----------
 # 1) Duration window
@@ -161,12 +158,12 @@ def bill_align(actual, billing):
         return False
     return abs(actual - billing) <= BILLING_TOL_MIN
 
-check_billing = merged.apply(lambda r: bill_align(r["Actual Minutes"], r["_BillingMinutes"]), axis=1)
+check_billing = merged.apply(lambda r: bill_align(r["Actual Minutes"], r["Scheduled Minutes"]), axis=1)
 
 merged["_OverallPass"] = check_duration & check_locations & check_billing
 
 # ---------- Computed display fields ----------
-merged["Δ vs Billing (minutes)"] = merged["Actual Minutes"] - merged["_BillingMinutes"]
+merged["Δ vs Billing (minutes)"] = merged["Actual Minutes"] - merged["Scheduled Minutes"]
 merged["Δ vs Billing (HH:MM:SS)"] = merged["Δ vs Billing (minutes)"].apply(minutes_to_hhmmss_signed)
 
 # ---------- Display (only one Appointment ID; hide staff profile name) ----------
@@ -184,7 +181,7 @@ display_cols = [
     "User signature location",
     "Parent signature location",
     "Service Name",
-    "Billing Minutes",
+    "Scheduled Minutes",
     "Actual Minutes",
     "Δ vs Billing (HH:MM:SS)",
 ]
@@ -215,9 +212,9 @@ c1, c2, c3 = st.columns(3)
 with c1:
     st.download_button("⬇️ Download All by Date", data=xlsx_all, file_name="all_by_date.xlsx")
 with c2:
-    st.download_button("✅ Download Clean by Date", data=xlsx_clean, file_name="clean_by_date.xlsx")
+    st.download_button("✅ Ready to Bill", data=xlsx_clean, file_name="clean_by_date.xlsx")
 with c3:
-    st.download_button("⚠️ Download Flagged by Date", data=xlsx_flagged, file_name="flagged_by_date.xlsx")
+    st.download_button("⚠️ Flagged", data=xlsx_flagged, file_name="flagged_by_date.xlsx")
 
 st.caption(
     f"""
