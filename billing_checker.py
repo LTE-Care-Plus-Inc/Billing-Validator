@@ -145,7 +145,7 @@ merged["Scheduled Minutes"] = pd.to_numeric(merged["Billing Minutes"], errors="c
 
 # ---------- Checks (internal only; not in output) ----------
 # 1) Duration window
-check_duration = merged["Actual Minutes"].apply(lambda m: (not pd.isna(m)) and (m > MIN_MINUTES) and (m < MAX_MINUTES))
+check_duration = merged["Actual Minutes"].apply(lambda m: (not pd.isna(m)) and (m >= MIN_MINUTES))
 
 # 2) BOTH locations present
 loc_start_ok = merged["Location (start)"].notna() & (merged["Location (start)"].astype(str).str.strip() != "")
@@ -221,7 +221,7 @@ st.caption(
 **Internal checks (not shown in table):**
 - File 2 filtered to **Service Name == "{SERVICE_REQUIRED}"**
 - File 1 filtered to **Status == "{STATUS_REQUIRED}"**
-- Duration strictly > {MIN_MINUTES} and < {MAX_MINUTES} minutes
+- Duration strictly >= {MIN_MINUTES} and < {MAX_MINUTES} minutes
 - **Both** Location (start) and Location (end) must have content
 - Billing within ±{BILLING_TOL_MIN} minutes (see signed Δ column)
 """
