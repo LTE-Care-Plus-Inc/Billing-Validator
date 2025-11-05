@@ -156,7 +156,7 @@ check_locations = loc_start_ok & loc_end_ok
 def bill_align(actual, billing):
     if pd.isna(actual) or pd.isna(billing):
         return False
-    return abs(actual - billing) <= BILLING_TOL_MIN
+    return abs(actual - billing) < BILLING_TOL_MIN
 
 check_billing = merged.apply(lambda r: bill_align(r["Actual Minutes"], r["Scheduled Minutes"]), axis=1)
 
