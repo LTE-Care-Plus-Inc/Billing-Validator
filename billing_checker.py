@@ -20,10 +20,6 @@ REQ_FILE1 = [
     "End time",
     "Duration",
     "AlohaABA Appointment ID",
-    "Location (start)",
-    "Location (end)",
-    "User signature location",
-    "Parent signature location",
 ]
 
 REQ_FILE2 = ["Appointment ID", "Billing Minutes", "Staff Name", "Client Name", "Appt. Date", "Service Name"]
@@ -106,6 +102,42 @@ df2 = pd.read_excel(f2, dtype=object)
 if not (ensure_cols(df1, REQ_FILE1, "File 1 (HiRasmus)") and ensure_cols(df2, REQ_FILE2, "File 2 (Aloha)")):
     st.stop()
 
+# ---------- Let user pick location columns (only location fields) ----------
+# ---------- Location fields (horizontal) ----------
+possible_location_cols = [
+    "Location (start)",
+    "Location (end)",
+    "User signature location",
+    "Parent signature location",
+]
+
+available_location_cols = [c for c in possible_location_cols if c in df1.columns]
+
+if not available_location_cols:
+    available_location_cols = [c for c in df1.columns if "location" in c.lower()]
+
+st.markdown("**Select the location fields to validate (1–4):**")
+
+selected_location_cols = []
+num_cols = 4  # change to 4 if you want tighter rows
+cols = st.columns(num_cols)
+
+for i, col_name in enumerate(available_location_cols):
+    with cols[i % num_cols]:
+        default_checked = col_name in ["Location (start)", "Location (end)"]
+        checked = st.checkbox(col_name, value=default_checked, key=f"loc_{col_name}")
+        if checked:
+            selected_location_cols.append(col_name)
+
+# enforce max 4
+if len(selected_location_cols) == 0:
+    st.warning("No location fields selected — location check will fail.")
+elif len(selected_location_cols) > 4:
+    st.warning("You selected more than 4 location fields — only the first 4 will be used.")
+    selected_location_cols = selected_location_cols[:4]
+
+
+
 # ---------- Clean up ----------
 for df in (df1, df2):
     for c in df.columns:
@@ -148,9 +180,18 @@ merged["Scheduled Minutes"] = pd.to_numeric(merged["Billing Minutes"], errors="c
 check_duration = merged["Actual Minutes"].apply(lambda m: (not pd.isna(m)) and (m >= MIN_MINUTES))
 
 # 2) BOTH locations present
-loc_start_ok = merged["Location (start)"].notna() & (merged["Location (start)"].astype(str).str.strip() != "")
-loc_end_ok   = merged["Location (end)"].notna() & (merged["Location (end)"].astype(str).str.strip() != "")
-check_locations = loc_start_ok & loc_end_ok
+# ---------- Dynamic location check ----------
+if selected_location_cols:
+    loc_checks = []
+    for col in selected_location_cols:
+        has_val = merged[col].notna() & (merged[col].astype(str).str.strip() != "")
+        loc_checks.append(has_val)
+
+    from functools import reduce
+    import operator
+    check_locations = reduce(operator.and_, loc_checks)
+else:
+    check_locations = pd.Series(False, index=merged.index)
 
 # 3) Billing alignment ±8 min
 def bill_align(actual, billing):
