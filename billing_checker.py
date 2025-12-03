@@ -61,7 +61,7 @@ MIN_MINUTES = 60    # >= 1 hour
 MAX_MINUTES = 360   # <= 6 hours
 
 # Column name for time-adjustment parent approval signature
-TIME_ADJ_COL = "Parent's Signature Approval for Time Adjustment signature"
+TIME_ADJ_COL = "Parent’s Signature Approval for Time Adjustment signature"
 
 # Required columns in the uploaded sessions file
 REQ_COLS = [
