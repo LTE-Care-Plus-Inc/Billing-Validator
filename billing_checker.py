@@ -25,7 +25,7 @@ SESSION_REQUIRED = "1:1 BT Direct Service"
 
 MIN_MINUTES = 60    # >= 1 hour
 MAX_MINUTES = 360   # <= 6 hours
-
+BILLING_TOL_DEFAULT = 8
 # Column name for time-adjustment parent approval signature
 TIME_ADJ_COL = "Parent’s Signature Approval for Time Adjustment signature"
 
@@ -33,8 +33,6 @@ TIME_ADJ_COL = "Parent’s Signature Approval for Time Adjustment signature"
 REQ_COLS = [
     "Status",
     "Client",
-    "Start time",
-    "End time",
     "Duration",
     "Session",
     "Parent signature time",
@@ -223,11 +221,6 @@ def within_time_tol(
     tol_early_min: float,
     tol_late_min: float,
 ) -> bool:
-    """
-    Compare two timestamps and return True if within allowed window:
-      - early: >= tol_early_min  (negative)
-      - late:  <= tol_late_min   (positive)
-    """
     if pd.isna(sig_ts) or pd.isna(base_ts):
         return False
 
@@ -293,20 +286,32 @@ def parse_session_time_range(session_time: Any, base_date: Any):
 # -----------------------------
 st.sidebar.header("Settings")
 
-# Signature tolerance modifiers
-SIG_TOL_EARLY = st.sidebar.number_input(
-    "Signature early tolerance (minutes, negative)",
-    value=-15,
-    step=1,
-    help="Earliest allowed time before session end (e.g., -15 means 15 minutes before).",
-)
-SIG_TOL_LATE = st.sidebar.number_input(
-    "Signature late tolerance (minutes, positive)",
-    value=30,
-    min_value=0,
-    step=1,
-    help="Latest allowed time after session end (e.g., 30 means up to 30 minutes after).",
-)
+with st.sidebar.expander("Signature Settings", expanded=False):
+    SIG_TOL_EARLY = st.number_input(
+        "Signature early tolerance (minutes, negative)",
+        value=-15,
+        step=1,
+        help="Earliest allowed time before session end (e.g., -15 means 15 minutes before).",
+    )
+    SIG_TOL_LATE = st.number_input(
+        "Signature late tolerance (minutes, positive)",
+        value=480,
+        min_value=0,
+        step=1,
+        help="Latest allowed time after session end (e.g., 30 means up to 30 minutes after).",
+    )
+with st.sidebar.expander("Duration / Billing Settings", expanded=False):
+    BILLING_TOL = st.number_input(
+        "Billing duration tolerance (minutes)",
+        value=BILLING_TOL_DEFAULT,
+        min_value=0,
+        step=1,
+        help=(
+            "If a session's duration is outside the base range "
+            f"({MIN_MINUTES}-{MAX_MINUTES} min) by at most this many minutes, "
+            "it will still be treated as OK."
+        ),
+    )
 
 # BT Contacts (optional) – used in Session Checker tab
 st.sidebar.header("BT Contacts (optional)")
@@ -316,7 +321,6 @@ bt_contacts_file = st.sidebar.file_uploader(
     key="bt_contacts",
 )
 
-# Instructions toggle
 # Instructions toggle
 with st.expander("Instructions", expanded=False):
     st.markdown(
@@ -485,38 +489,67 @@ def has_time_adjust_sig(row) -> bool:
 
 
 def duration_ok_base(row) -> bool:
-    """Base duration check: MIN_MINUTES–MAX_MINUTES minutes."""
+    """Base duration check with billing tolerance.
+
+    - Base allowed range: MIN_MINUTES–MAX_MINUTES.
+    - If duration is outside this range BUT within BILLING_TOL minutes of a limit,
+      treat it as OK.
+    - Only if it's beyond the base range by more than BILLING_TOL minutes is it flagged.
+    """
     m = row["Actual Minutes"]
-    return (not pd.isna(m)) and (m >= MIN_MINUTES) and (m <= MAX_MINUTES)
-
-
-def sig_ok_base(row) -> bool:
-    """
-    Base signature check:
-    - Uses asymmetric tolerance (SIG_TOL_EARLY, SIG_TOL_LATE).
-    - If no signatures at all, pass.
-    """
-    base_ts = row.get("_End_dt", pd.NaT)
-    if pd.isna(base_ts):
+    if pd.isna(m):
         return False
 
-    parent_sig_ts = row.get("_ParentSig_dt", pd.NaT)
-    user_sig_ts = row.get("_UserSig_dt", pd.NaT)
-
-    checks = []
-
-    if not pd.isna(parent_sig_ts):
-        checks.append(within_time_tol(parent_sig_ts, base_ts, SIG_TOL_EARLY, SIG_TOL_LATE))
-
-    if not pd.isna(user_sig_ts):
-        checks.append(within_time_tol(user_sig_ts, base_ts, SIG_TOL_EARLY, SIG_TOL_LATE))
-
-    # No signatures at all → pass
-    if pd.isna(parent_sig_ts) and pd.isna(user_sig_ts):
+    # Inside base allowed range → always OK
+    if MIN_MINUTES <= m <= MAX_MINUTES:
         return True
 
-    # All present signatures must pass tolerance
-    return all(checks)
+    # Outside base range → see if it's within tolerance
+    # (e.g., MIN=60, MAX=360, TOL=8 → passes if 52–60 or 360–368)
+    diff_below = MIN_MINUTES - m if m < MIN_MINUTES else 0
+    diff_above = m - MAX_MINUTES if m > MAX_MINUTES else 0
+
+    # If it's only a small violation (<= BILLING_TOL), still OK
+    if diff_below > 0 and diff_below <= BILLING_TOL:
+        return True
+    if diff_above > 0 and diff_above <= BILLING_TOL:
+        return True
+
+    # Otherwise, flag it
+    return False
+
+
+
+def duration_ok_base(row) -> bool:
+    """Base duration check with over-max billing tolerance.
+
+    - Always fail if duration < MIN_MINUTES.
+    - Pass if MIN_MINUTES <= duration <= MAX_MINUTES.
+    - If duration > MAX_MINUTES, allow up to BILLING_TOL minutes over the max.
+      Only flag if it exceeds MAX_MINUTES + BILLING_TOL.
+    """
+    m = row["Actual Minutes"]
+    if pd.isna(m):
+        return False
+
+    # Too short -> always fail (no tolerance below min)
+    if m < MIN_MINUTES:
+        return False
+
+    # Within base range -> OK
+    if m <= MAX_MINUTES:
+        return True
+
+    # Over max -> allow up to BILLING_TOL minutes over
+    over_by = m - MAX_MINUTES
+    if over_by <= BILLING_TOL:
+        return True
+
+    # More than BILLING_TOL minutes over -> fail
+    return False
+
+
+
 
 
 def external_match_ok(row) -> bool:
@@ -598,7 +631,7 @@ def get_failure_reasons(row) -> str:
 
     # External session failures
     if not eval_res["ext_ok"]:
-        reasons.append("No matching Session Time in external file")
+        reasons.append("Session time empty on note")
 
     return "; ".join(reasons) if reasons else "PASS"
 
@@ -618,23 +651,13 @@ with tab2:
         st.info("Upload the HiRamsus Excel file to continue.")
         st.stop()
 
-    st.subheader("1b) External Session List")
-
     external_sessions_df = st.session_state.get("external_sessions_df", None)
 
     if external_sessions_df is not None and len(external_sessions_df) > 0:
         st.success(
             f"Using {len(external_sessions_df)} external session rows from the **Tools** tab."
         )
-        manual_external_file = st.file_uploader(
-            "Optional: Override with external session file (Client, Session Time)",
-            type=["csv", "xlsx"],
-            key="external_sessions_manual",
-        )
-        if manual_external_file is not None:
-            ext_df_candidate = read_any(manual_external_file)
-            external_sessions_df = ext_df_candidate
-            st.info("External sessions overridden by manually uploaded file.")
+
     else:
         st.warning(
             "No external sessions found from the Tools tab yet. "
@@ -650,7 +673,7 @@ with tab2:
 
     # Checkbox: use second parent signature as override for signature timing only
     global USE_TIME_ADJ_OVERRIDE
-    USE_TIME_ADJ_OVERRIDE = st.checkbox(
+    USE_TIME_ADJ_OVERRIDE = st.toggle(
         f"Use '{TIME_ADJ_COL}' as a signature override (only for sessions that failed signature timing; duration still enforced)",
         value=False,
     )
@@ -672,11 +695,6 @@ with tab2:
         (df["Status"].astype(str).str.strip() == STATUS_REQUIRED)
         & (df["Session"].astype(str).str.strip() == SESSION_REQUIRED)
     ].copy()
-
-    st.caption(
-        f'Prefilters → Status == "{STATUS_REQUIRED}" | Session == "{SESSION_REQUIRED}"'
-    )
-    st.write({"Rows (before/after)": f"{len(df)}/{len(df_f)}"})
 
     # ---------- Parse Duration (initially from HiRasmus Duration) ----------
     df_f["Actual Minutes"] = df_f["Duration"].apply(parse_duration_to_minutes)
@@ -842,14 +860,11 @@ with tab2:
         "Staff Name",
         "Phone",
         "Email",
-        "Start time",
-        "End time",
         "Duration",
         "Actual Minutes",
         "Parent signature time",
         "User signature time",
-        "Session Time",           # from external file (if provided)
-        "Has External Session",   # True/False (if external data provided)
+        "Session Time",   
     ]
 
     # Show the time-adjustment approval column if present
@@ -869,7 +884,8 @@ with tab2:
     present_cols = [c for c in display_cols if c in df_f.columns]
 
     st.subheader("2) Results")
-    st.dataframe(df_f[present_cols], use_container_width=True, height=560)
+    with st.expander("Summary", expanded=False):
+        st.dataframe(df_f[present_cols], use_container_width=True, height=560)
 
     st.caption("Summary")
     summary = pd.DataFrame(
