@@ -407,8 +407,11 @@ After all checks, the app:
 # -----------------------------
 # TABS
 # -----------------------------
-tab1, tab2 = st.tabs(["1️⃣ Tools – Extract External Sessions", "2️⃣ Session Checker"])
-
+tab1, tab2, tab3 = st.tabs([
+    "1️⃣ Tools – Extract External Sessions",
+    "2️⃣ Session Checker",
+    "3️⃣ Billed Checker",
+])
 # Keep external sessions DF across tabs
 if "external_sessions_df" not in st.session_state:
     st.session_state["external_sessions_df"] = None
@@ -488,37 +491,6 @@ def has_time_adjust_sig(row) -> bool:
     return s not in ("", "nan")
 
 
-def duration_ok_base(row) -> bool:
-    """Base duration check with billing tolerance.
-
-    - Base allowed range: MIN_MINUTES–MAX_MINUTES.
-    - If duration is outside this range BUT within BILLING_TOL minutes of a limit,
-      treat it as OK.
-    - Only if it's beyond the base range by more than BILLING_TOL minutes is it flagged.
-    """
-    m = row["Actual Minutes"]
-    if pd.isna(m):
-        return False
-
-    # Inside base allowed range → always OK
-    if MIN_MINUTES <= m <= MAX_MINUTES:
-        return True
-
-    # Outside base range → see if it's within tolerance
-    # (e.g., MIN=60, MAX=360, TOL=8 → passes if 52–60 or 360–368)
-    diff_below = MIN_MINUTES - m if m < MIN_MINUTES else 0
-    diff_above = m - MAX_MINUTES if m > MAX_MINUTES else 0
-
-    # If it's only a small violation (<= BILLING_TOL), still OK
-    if diff_below > 0 and diff_below <= BILLING_TOL:
-        return True
-    if diff_above > 0 and diff_above <= BILLING_TOL:
-        return True
-
-    # Otherwise, flag it
-    return False
-
-
 
 def duration_ok_base(row) -> bool:
     """Base duration check with over-max billing tolerance.
@@ -561,7 +533,51 @@ def external_match_ok(row) -> bool:
     if "Has External Session" not in row.index:
         return True
     return bool(row["Has External Session"])
+def sig_ok_base(row) -> bool:
+    """
+    Signature timing check against session end time.
 
+    Uses:
+    - _End_dt as the base timestamp
+    - _ParentSig_dt and _UserSig_dt for signatures
+    - SIG_TOL_EARLY / SIG_TOL_LATE from the sidebar
+    """
+    base_ts = row.get("_End_dt", pd.NaT)
+
+    parent_sig_ts = row.get("_ParentSig_dt", pd.NaT)
+    user_sig_ts = row.get("_UserSig_dt", pd.NaT)
+
+    # If both signatures are missing, treat as OK (no timing to check)
+    if pd.isna(parent_sig_ts) and pd.isna(user_sig_ts):
+        return True
+
+    if pd.isna(base_ts):
+        return False
+
+    checks = []
+
+    if not pd.isna(parent_sig_ts):
+        checks.append(
+            within_time_tol(
+                parent_sig_ts,
+                base_ts,
+                SIG_TOL_EARLY,
+                SIG_TOL_LATE,
+            )
+        )
+
+    if not pd.isna(user_sig_ts):
+        checks.append(
+            within_time_tol(
+                user_sig_ts,
+                base_ts,
+                SIG_TOL_EARLY,
+                SIG_TOL_LATE,
+            )
+        )
+
+    # require all present signatures to be within tolerance
+    return all(checks) if checks else False
 
 # Combined evaluation (uses checkbox + override)
 def evaluate_row(row) -> dict:
