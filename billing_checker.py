@@ -920,6 +920,14 @@ with tab2:
     else:
         export_df = df_f.copy()
 
+        # Store final Session Checker dataframe for use in Tab 3 (Billed Checker)
+    # We keep only the columns we display/export (present_cols).
+       # Store final Session Checker dataframe for use in Tab 3 (Billed Checker)
+    # Keep full export_df (so we still have _OverallPass, AlohaABA Appointment ID, etc.)
+    st.session_state["session_checker_df"] = export_df.copy()
+    st.session_state["session_checker_present_cols"] = present_cols
+
+
     xlsx_all = export_excel(export_df[present_cols])
     xlsx_clean = export_excel(export_df[export_df["_OverallPass"]][present_cols])
     xlsx_flagged = export_excel(export_df[~export_df["_OverallPass"]][present_cols])
@@ -937,3 +945,138 @@ with tab2:
         st.download_button(
             "⚠️ Failed Only", data=xlsx_flagged, file_name="flagged_sessions.xlsx"
         )
+
+# =========================================================
+# TAB 3: BILLED CHECKER – BILLED / UNBILLED / NO MATCH
+# =========================================================
+with tab3:
+    st.header("Billed Checker – Billed / Unbilled / No Match")
+
+    base_df = st.session_state.get("session_checker_df")
+    present_cols = st.session_state.get("session_checker_present_cols")
+
+    if base_df is None or present_cols is None:
+        st.info(
+            "Please run the **Session Checker** in Tab 2 first. "
+            "Once you have results there, come back here."
+        )
+    else:
+        st.subheader("Upload Aloha Billing Status File")
+
+        billing_file = st.file_uploader(
+            "Upload Aloha file with billed & unbilled sessions "
+            "(must include 'Appointment ID' and 'Date Billed')",
+            type=["xlsx", "xls", "csv"],
+            key="billing_status_file",
+        )
+
+        if billing_file is not None:
+            try:
+                billing_df = read_any(billing_file)
+            except Exception as e:
+                billing_df = None
+                st.error(f"Error reading billing status file: {e}")
+
+            if billing_df is not None:
+                billing_df = normalize_cols(billing_df)
+
+                # Check required columns
+                if "Appointment ID" not in billing_df.columns or "Date Billed" not in billing_df.columns:
+                    st.error(
+                        "Billing status file must contain columns: 'Appointment ID' and 'Date Billed'."
+                    )
+                elif "AlohaABA Appointment ID" not in base_df.columns:
+                    st.error(
+                        "Session Checker data is missing 'AlohaABA Appointment ID'. "
+                        "Please ensure the HiRasmus export includes this column."
+                    )
+                else:
+                    # Merge Session Checker data with billing status on Appointment ID
+                    merged = base_df.merge(
+                        billing_df[["Appointment ID", "Date Billed"]],
+                        left_on="AlohaABA Appointment ID",
+                        right_on="Appointment ID",
+                        how="left",
+                        sort=False,
+                    )
+
+                    # Classify billing status per row
+                    def classify_status(row):
+                        app_id = str(row.get("Appointment ID", "")).strip()
+                        date_billed = str(row.get("Date Billed", "")).strip()
+
+                        # No match at all in billing file
+                        if app_id == "" or app_id.lower() == "nan":
+                            return "No Match"
+
+                        # Matched, now check if billed vs unbilled
+                        if date_billed != "" and date_billed.lower() != "nan":
+                            return "Billed"
+                        return "Unbilled"
+
+                    merged["Billing Status"] = merged.apply(classify_status, axis=1)
+
+                    # Counts
+                    total_sessions = len(merged)
+                    billed_count = int((merged["Billing Status"] == "Billed").sum())
+                    unbilled_count = int((merged["Billing Status"] == "Unbilled").sum())
+                    nomatch_count = int((merged["Billing Status"] == "No Match").sum())
+
+                    # Small summary print
+                    st.markdown(
+                        f"""
+**Total sessions (from Session Checker):** {total_sessions}  
+- **Billed:** {billed_count}  
+- **Unbilled:** {unbilled_count}  
+- **No Match (no Appointment ID match):** {nomatch_count}
+"""
+                    )
+
+                    # Optional: show a tiny table for quick view
+                    summary_df = pd.DataFrame(
+                        {
+                            "Status": ["Billed", "Unbilled", "No Match"],
+                            "Count": [billed_count, unbilled_count, nomatch_count],
+                        }
+                    )
+                    st.table(summary_df)
+                    # ---------- Downloads by Billing Status ----------
+                    # Decide which columns to export:
+                    # - Everything you normally show (present_cols)
+                    # - Plus Appointment ID, Date Billed, Billing Status (if present)
+                    dl_cols = [
+                        c
+                        for c in dict.fromkeys(
+                            present_cols
+                            + ["Appointment ID", "Date Billed", "Billing Status"]
+                        ).keys()
+                        if c in merged.columns
+                    ]
+
+                    billed_df = merged[merged["Billing Status"] == "Billed"][dl_cols]
+                    unbilled_df = merged[merged["Billing Status"] == "Unbilled"][dl_cols]
+                    nomatch_df = merged[merged["Billing Status"] == "No Match"][dl_cols]
+
+                    xlsx_billed = export_excel(billed_df)
+                    xlsx_unbilled = export_excel(unbilled_df)
+                    xlsx_nomatch = export_excel(nomatch_df)
+
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        st.download_button(
+                            "⬇️ Billed Sessions",
+                            data=xlsx_billed,
+                            file_name="billed_sessions.xlsx",
+                        )
+                    with c2:
+                        st.download_button(
+                            "⬇️ Unbilled Sessions",
+                            data=xlsx_unbilled,
+                            file_name="unbilled_sessions.xlsx",
+                        )
+                    with c3:
+                        st.download_button(
+                            "⬇️ No Match Sessions",
+                            data=xlsx_nomatch,
+                            file_name="no_match_sessions.xlsx",
+                        )
