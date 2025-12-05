@@ -32,6 +32,7 @@ TIME_ADJ_COL = "Parent’s Signature Approval for Time Adjustment signature"
 # Required columns in the uploaded sessions file
 REQ_COLS = [
     "Status",
+    "AlohaABA Appointment ID",
     "Client",
     "Duration",
     "Session",
@@ -346,7 +347,8 @@ There are **two tabs** in this app:
    This file contains one row per BT session. It **must include** the following columns:
 
    - `Status`  
-   - `Session`  
+   - `Session`
+   - `Aloha Appointment ID  
    - `Client`  
    - `User`  
    - `Start time`  
@@ -869,8 +871,7 @@ with tab2:
 
     # ---------- Display ----------
     display_cols = [
-        "Status",
-        "Session",
+        "AlohaABA Appointment ID",
         "Date",
         "Client Name",
         "Staff Name",
