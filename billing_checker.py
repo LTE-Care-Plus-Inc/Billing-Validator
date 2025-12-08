@@ -25,7 +25,9 @@ SESSION_REQUIRED = "1:1 BT Direct Service"
 
 MIN_MINUTES = 60    # >= 1 hour
 MAX_MINUTES = 360   # <= 6 hours
-BILLING_TOL_DEFAULT = 8
+BILLING_TOL_DEFAULT = 8      # up to 8 min over MAX allowed
+DAILY_MAX_MINUTES = 480      # <= 8 hours per BT per day
+
 # Column name for time-adjustment parent approval signature
 TIME_ADJ_COL = "Parent’s Signature Approval for Time Adjustment signature"
 
@@ -39,6 +41,7 @@ REQ_COLS = [
     "Parent signature time",
     "User signature time",
     "User",
+    "Start date",   # mandatory date column from HiRasmus
 ]
 
 # -----------------------------
@@ -301,6 +304,7 @@ with st.sidebar.expander("Signature Settings", expanded=False):
         step=1,
         help="Latest allowed time after session end (e.g., 30 means up to 30 minutes after).",
     )
+
 with st.sidebar.expander("Duration / Billing Settings", expanded=False):
     BILLING_TOL = st.number_input(
         "Billing duration tolerance (minutes)",
@@ -348,11 +352,10 @@ There are **two tabs** in this app:
 
    - `Status`  
    - `Session`
-   - `Aloha Appointment ID  
+   - `Aloha Appointment ID`  
    - `Client`  
    - `User`  
-   - `Start time`  
-   - `End time`  
+   - `Start date`  
    - `Duration`  
    - `Parent signature time`  
    - `User signature time`  
@@ -396,13 +399,14 @@ There are **two tabs** in this app:
   **“Parent’s Signature Approval for Time Adjustment signature”**  
   as an override:
   - If enabled and that field is present on a row, **signature timing failures are ignored** for that row.
-  - **Duration rules are always enforced**.
+  - **Duration rules and daily 8-hour limit are always enforced**.
 
 After all checks, the app:
 
 - Shows a detailed table with pass/fail indicators and reasons  
 - Excludes test client **“Marry Wang Demo”** from the final Excel exports  
-- Provides three downloads: **All**, **Passed Only**, and **Failed Only** sessions.
+- Provides three downloads: **All**, **Passed Only**, and **Failed Only** sessions in Tab 2,  
+  and four billing files in Tab 3.
         """
     )
 
@@ -414,6 +418,7 @@ tab1, tab2, tab3 = st.tabs([
     "2️⃣ Session Checker",
     "3️⃣ Billed Checker",
 ])
+
 # Keep external sessions DF across tabs
 if "external_sessions_df" not in st.session_state:
     st.session_state["external_sessions_df"] = None
@@ -461,9 +466,6 @@ with tab1:
                     "These will be used automatically in the **Session Checker** tab."
                 )
 
-                # Download TXT version as well
-                txt_filename = re.sub(r"\.pdf$", ".txt", pdf_file.name, flags=re.IGNORECASE)
-
                 # Download external sessions Excel
                 ext_xlsx = notes_to_excel_bytes(ext_df.to_dict(orient="records"), sheet_name="External Sessions")
                 st.download_button(
@@ -491,7 +493,6 @@ def has_time_adjust_sig(row) -> bool:
         return False
     s = str(val).strip().lower()
     return s not in ("", "nan")
-
 
 
 def duration_ok_base(row) -> bool:
@@ -523,9 +524,6 @@ def duration_ok_base(row) -> bool:
     return False
 
 
-
-
-
 def external_match_ok(row) -> bool:
     """
     External session requirement:
@@ -535,12 +533,14 @@ def external_match_ok(row) -> bool:
     if "Has External Session" not in row.index:
         return True
     return bool(row["Has External Session"])
+
+
 def sig_ok_base(row) -> bool:
     """
     Signature timing check against session end time.
 
     Uses:
-    - _End_dt as the base timestamp
+    - _End_dt as the base timestamp (from internal PDF-derived times)
     - _ParentSig_dt and _UserSig_dt for signatures
     - SIG_TOL_EARLY / SIG_TOL_LATE from the sidebar
     """
@@ -554,6 +554,7 @@ def sig_ok_base(row) -> bool:
         return True
 
     if pd.isna(base_ts):
+        # There ARE signatures but no internal end time to compare against
         return False
 
     checks = []
@@ -581,6 +582,18 @@ def sig_ok_base(row) -> bool:
     # require all present signatures to be within tolerance
     return all(checks) if checks else False
 
+
+def daily_total_ok(row) -> bool:
+    """
+    Check if total minutes for this Staff on this Date exceed DAILY_MAX_MINUTES.
+    Uses precomputed 'Daily Minutes'.
+    """
+    m = row.get("Daily Minutes")
+    if pd.isna(m):
+        return True
+    return m <= DAILY_MAX_MINUTES
+
+
 # Combined evaluation (uses checkbox + override)
 def evaluate_row(row) -> dict:
     """
@@ -588,17 +601,19 @@ def evaluate_row(row) -> dict:
       - duration_ok
       - sig_ok
       - ext_ok
+      - daily_ok
       - has_time_adj_sig
       - overall_pass
     Applies override logic when checkbox is ON:
       - If USE_TIME_ADJ_OVERRIDE and row has second parent signature:
           signature issues are ignored (sig_ok = True)
-      - Duration is ALWAYS enforced.
+      - Duration and daily limits are ALWAYS enforced.
     """
     dur_base = duration_ok_base(row)
     sig_base = sig_ok_base(row)
     ext_ok = external_match_ok(row)
     adj_sig = has_time_adjust_sig(row)
+    daily_ok_val = daily_total_ok(row)
 
     # Start from base
     duration_ok = dur_base
@@ -608,12 +623,13 @@ def evaluate_row(row) -> dict:
     if USE_TIME_ADJ_OVERRIDE and adj_sig:
         sig_ok = True
 
-    overall = duration_ok and sig_ok and ext_ok
+    overall = duration_ok and sig_ok and ext_ok and daily_ok_val
 
     return {
         "duration_ok": duration_ok,
         "sig_ok": sig_ok,
         "ext_ok": ext_ok,
+        "daily_ok": daily_ok_val,
         "has_time_adj_sig": adj_sig,
         "overall_pass": overall,
         "duration_ok_base": dur_base,
@@ -633,7 +649,7 @@ def get_failure_reasons(row) -> str:
         else:
             reasons.append(
                 f"Duration ({actual_min:.0f} min) is outside allowed range "
-                f"({MIN_MINUTES}-{MAX_MINUTES} min)"
+                f"({MIN_MINUTES}-{MAX_MINUTES} min, +{BILLING_TOL} min tolerance over max)"
             )
 
     # Signature failures (after considering override)
@@ -650,6 +666,15 @@ def get_failure_reasons(row) -> str:
     # External session failures
     if not eval_res["ext_ok"]:
         reasons.append("Session time empty on note")
+
+    # Daily total failures
+    if not eval_res.get("daily_ok", True):
+        daily_min = row.get("Daily Minutes")
+        if not pd.isna(daily_min):
+            reasons.append(
+                f"Total daily duration for this BT on {row.get('Date')} "
+                f"({daily_min:.0f} min) exceeds {DAILY_MAX_MINUTES} min"
+            )
 
     return "; ".join(reasons) if reasons else "PASS"
 
@@ -675,7 +700,6 @@ with tab2:
         st.success(
             f"Using {len(external_sessions_df)} external session rows from the **Tools** tab."
         )
-
     else:
         st.warning(
             "No external sessions found from the Tools tab yet. "
@@ -692,13 +716,17 @@ with tab2:
     # Checkbox: use second parent signature as override for signature timing only
     global USE_TIME_ADJ_OVERRIDE
     USE_TIME_ADJ_OVERRIDE = st.toggle(
-        f"Use '{TIME_ADJ_COL}' as a signature override (only for sessions that failed signature timing; duration still enforced)",
+        f"Use '{TIME_ADJ_COL}' as a signature override (only for sessions that failed signature timing; duration & daily limit still enforced)",
         value=False,
     )
 
     # ---------- Read and normalize Sessions file ----------
     df = pd.read_excel(sessions_file, dtype=object)
     df = normalize_cols(df)
+
+    # Handle possible "Start Date" vs "Start date" header
+    if "Start date" not in df.columns and "Start Date" in df.columns:
+        df = df.rename(columns={"Start Date": "Start date"})
 
     if not ensure_cols(df, REQ_COLS, "Sessions File"):
         st.stop()
@@ -714,24 +742,20 @@ with tab2:
         & (df["Session"].astype(str).str.strip() == SESSION_REQUIRED)
     ].copy()
 
-    # ---------- Parse Duration (initially from HiRasmus Duration) ----------
+   # ---------- Parse Duration (initially from HiRasmus Duration) ----------
     df_f["Actual Minutes"] = df_f["Duration"].apply(parse_duration_to_minutes)
 
-    # ---------- Parse Time Columns from HiRasmus (for date + backup) ----------
-    start_dt = pd.to_datetime(df_f["Start time"], errors="coerce")
-    end_dt = pd.to_datetime(df_f["End time"], errors="coerce")
+    # ---------- Parse Date from Start date (keep only text before first space) ----------
+    start_raw = df_f["Start date"].astype(str).str.strip()
+    # e.g. "11/30/2025  5:00:00 PM" -> "11/30/2025"
+    start_clean = start_raw.str.split().str[0]
 
-    df_f["_Start_dt"] = start_dt
-    df_f["_End_dt"] = end_dt  # may be overridden by external Session Time
+    df_f["Date"] = pd.to_datetime(start_clean, errors="coerce").dt.date
+
+    # Internal end time (for signature) will come from PDF-derived times only
+    df_f["_End_dt"] = pd.NaT
     df_f["_ParentSig_dt"] = pd.to_datetime(df_f["Parent signature time"], errors="coerce")
     df_f["_UserSig_dt"] = pd.to_datetime(df_f["User signature time"], errors="coerce")
-
-    # ---------- Date column (prefer End time date, fall back to Start time date) ----------
-    date_from_end = df_f["_End_dt"].dt.date
-    date_from_start = df_f["_Start_dt"].dt.date
-
-    df_f["Date"] = date_from_end
-    df_f.loc[df_f["Date"].isna(), "Date"] = date_from_start[df_f["Date"].isna()]
 
     # ---------- Normalize names ----------
     df_f["Staff Name"] = df_f["User"].apply(normalize_name)
@@ -759,10 +783,10 @@ with tab2:
                 sort=False,
             )
 
-            # True if this HiRasmus row has a matching external session
+            # True if this HiRasmus row has a matching external session record
             df_f["Has External Session"] = df_f["Session Time"].notna()
 
-            # ---- Use Session Time to override start/end + duration when available ----
+            # ---- Use Session Time to derive internal start/end + override duration ----
             df_f[["_ExtStart_dt", "_ExtEnd_dt"]] = df_f.apply(
                 lambda r: pd.Series(
                     parse_session_time_range(r.get("Session Time"), r.get("Date"))
@@ -837,6 +861,11 @@ with tab2:
                 df_f["Phone"] = df_f["Staff Name"].map(staff_to_phone)
                 df_f["Email"] = df_f["Staff Name"].map(staff_to_email)
 
+    # ---------- Daily total minutes per Staff per Date ----------
+    df_f["Daily Minutes"] = (
+        df_f.groupby(["Staff Name", "Date"])["Actual Minutes"].transform("sum")
+    )
+
     # ---------- Run Checks ----------
     eval_results = df_f.apply(evaluate_row, axis=1, result_type="expand")
 
@@ -844,21 +873,21 @@ with tab2:
         df_f["_DurationOk"] = eval_results["duration_ok"]
         df_f["_SigOk"] = eval_results["sig_ok"]
         df_f["_ExtOk"] = eval_results["ext_ok"]
+        df_f["_DailyOk"] = eval_results["daily_ok"]
         df_f["_HasTimeAdjSig"] = eval_results["has_time_adj_sig"]
         df_f["_OverallPass"] = eval_results["overall_pass"]
     else:
         df_f["_DurationOk"] = eval_results.apply(lambda r: r["duration_ok"])
         df_f["_SigOk"] = eval_results.apply(lambda r: r["sig_ok"])
         df_f["_ExtOk"] = eval_results.apply(lambda r: r["ext_ok"])
+        df_f["_DailyOk"] = eval_results.apply(lambda r: r["daily_ok"])
         df_f["_HasTimeAdjSig"] = eval_results.apply(lambda r: r["has_time_adj_sig"])
         df_f["_OverallPass"] = eval_results.apply(lambda r: r["overall_pass"])
 
     df_f["Failure Reasons"] = df_f.apply(get_failure_reasons, axis=1)
 
-    # ---------- Pretty-print time columns ----------
+    # ---------- Pretty-print signature time columns ----------
     for col in [
-        "Start time",
-        "End time",
         "Parent signature time",
         "User signature time",
     ]:
@@ -879,9 +908,10 @@ with tab2:
         "Email",
         "Duration",
         "Actual Minutes",
+        "Daily Minutes",
         "Parent signature time",
         "User signature time",
-        "Session Time",   
+        "Session Time",
     ]
 
     # Show the time-adjustment approval column if present
@@ -893,6 +923,7 @@ with tab2:
             "_DurationOk",
             "_SigOk",
             "_ExtOk",
+            "_DailyOk",
             "_HasTimeAdjSig",
             "Failure Reasons",
         ]
@@ -916,17 +947,13 @@ with tab2:
 
     # ---------- Export (filter out 'Marry Wang Demo') ----------
     if "Client Name" in df_f.columns:
-        export_df = df_f[df_f["Client Name"] != "Marry Wang Demo"]
+        export_df = df_f[df_f["Client Name"] != "Marry Wang Demo"].copy()
     else:
         export_df = df_f.copy()
 
-        # Store final Session Checker dataframe for use in Tab 3 (Billed Checker)
-    # We keep only the columns we display/export (present_cols).
-       # Store final Session Checker dataframe for use in Tab 3 (Billed Checker)
-    # Keep full export_df (so we still have _OverallPass, AlohaABA Appointment ID, etc.)
+    # Store final Session Checker dataframe for use in Tab 3 (Billed Checker)
     st.session_state["session_checker_df"] = export_df.copy()
     st.session_state["session_checker_present_cols"] = present_cols
-
 
     xlsx_all = export_excel(export_df[present_cols])
     xlsx_clean = export_excel(export_df[export_df["_OverallPass"]][present_cols])
@@ -1016,34 +1043,52 @@ with tab3:
 
                     merged["Billing Status"] = merged.apply(classify_status, axis=1)
 
+                    # Split into categories
+                    billed_df = merged[merged["Billing Status"] == "Billed"]
+                    unbilled_df = merged[merged["Billing Status"] == "Unbilled"]
+                    nomatch_df = merged[merged["Billing Status"] == "No Match"]
+
+                    # Split unbilled into clean vs flagged based on _OverallPass
+                    unbilled_clean_df = unbilled_df[unbilled_df["_OverallPass"] == True]
+                    unbilled_flagged_df = unbilled_df[unbilled_df["_OverallPass"] == False]
+
                     # Counts
                     total_sessions = len(merged)
-                    billed_count = int((merged["Billing Status"] == "Billed").sum())
-                    unbilled_count = int((merged["Billing Status"] == "Unbilled").sum())
-                    nomatch_count = int((merged["Billing Status"] == "No Match").sum())
+                    billed_count = len(billed_df)
+                    unbilled_clean_count = len(unbilled_clean_df)
+                    unbilled_flagged_count = len(unbilled_flagged_df)
+                    nomatch_count = len(nomatch_df)
 
-                    # Small summary print
+                    # Summary
                     st.markdown(
                         f"""
 **Total sessions (from Session Checker):** {total_sessions}  
 - **Billed:** {billed_count}  
-- **Unbilled:** {unbilled_count}  
+- **Unbilled – Clean:** {unbilled_clean_count}  
+- **Unbilled – Flagged:** {unbilled_flagged_count}  
 - **No Match (no Appointment ID match):** {nomatch_count}
 """
                     )
 
-                    # Optional: show a tiny table for quick view
                     summary_df = pd.DataFrame(
                         {
-                            "Status": ["Billed", "Unbilled", "No Match"],
-                            "Count": [billed_count, unbilled_count, nomatch_count],
+                            "Status": [
+                                "Billed",
+                                "Unbilled – Clean",
+                                "Unbilled – Flagged",
+                                "No Match",
+                            ],
+                            "Count": [
+                                billed_count,
+                                unbilled_clean_count,
+                                unbilled_flagged_count,
+                                nomatch_count,
+                            ],
                         }
                     )
                     st.table(summary_df)
+
                     # ---------- Downloads by Billing Status ----------
-                    # Decide which columns to export:
-                    # - Everything you normally show (present_cols)
-                    # - Plus Appointment ID, Date Billed, Billing Status (if present)
                     dl_cols = [
                         c
                         for c in dict.fromkeys(
@@ -1053,15 +1098,17 @@ with tab3:
                         if c in merged.columns
                     ]
 
-                    billed_df = merged[merged["Billing Status"] == "Billed"][dl_cols]
-                    unbilled_df = merged[merged["Billing Status"] == "Unbilled"][dl_cols]
-                    nomatch_df = merged[merged["Billing Status"] == "No Match"][dl_cols]
+                    billed_dl = billed_df[dl_cols]
+                    unbilled_clean_dl = unbilled_clean_df[dl_cols]
+                    unbilled_flagged_dl = unbilled_flagged_df[dl_cols]
+                    nomatch_dl = nomatch_df[dl_cols]
 
-                    xlsx_billed = export_excel(billed_df)
-                    xlsx_unbilled = export_excel(unbilled_df)
-                    xlsx_nomatch = export_excel(nomatch_df)
+                    xlsx_billed = export_excel(billed_dl)
+                    xlsx_unbilled_clean = export_excel(unbilled_clean_dl)
+                    xlsx_unbilled_flagged = export_excel(unbilled_flagged_dl)
+                    xlsx_nomatch = export_excel(nomatch_dl)
 
-                    c1, c2, c3 = st.columns(3)
+                    c1, c2, c3, c4 = st.columns(4)
                     with c1:
                         st.download_button(
                             "⬇️ Billed Sessions",
@@ -1070,11 +1117,17 @@ with tab3:
                         )
                     with c2:
                         st.download_button(
-                            "⬇️ Unbilled Sessions",
-                            data=xlsx_unbilled,
-                            file_name="unbilled_sessions.xlsx",
+                            "⬇️ Unbilled – Clean",
+                            data=xlsx_unbilled_clean,
+                            file_name="unbilled_clean_sessions.xlsx",
                         )
                     with c3:
+                        st.download_button(
+                            "⬇️ Unbilled – Flagged",
+                            data=xlsx_unbilled_flagged,
+                            file_name="unbilled_flagged_sessions.xlsx",
+                        )
+                    with c4:
                         st.download_button(
                             "⬇️ No Match Sessions",
                             data=xlsx_nomatch,
