@@ -25,6 +25,7 @@ SESSION_REQUIRED = "1:1 BT Direct Service"
 
 MIN_MINUTES = 60    # >= 1 hour
 MAX_MINUTES = 360   # <= 6 hours
+BILLING_TOL_DEFAULT = 8
 # Column name for time-adjustment parent approval signature
 TIME_ADJ_COL = "Parent’s Signature Approval for Time Adjustment signature"
 
@@ -300,6 +301,18 @@ with st.sidebar.expander("Signature Settings", expanded=False):
         step=1,
         help="Latest allowed time after session end (e.g., 30 means up to 30 minutes after).",
     )
+with st.sidebar.expander("Duration / Billing Settings", expanded=False):
+    BILLING_TOL = st.number_input(
+        "Billing duration tolerance (minutes)",
+        value=BILLING_TOL_DEFAULT,
+        min_value=0,
+        step=1,
+        help=(
+            "If a session's duration is outside the base range "
+            f"({MIN_MINUTES}-{MAX_MINUTES} min) by at most this many minutes, "
+            "it will still be treated as OK."
+        ),
+    )
 
 # BT Contacts (optional) – used in Session Checker tab
 st.sidebar.header("BT Contacts (optional)")
@@ -482,17 +495,32 @@ def has_time_adjust_sig(row) -> bool:
 
 
 def duration_ok_base(row) -> bool:
-    """Base duration check with NO over-max billing tolerance.
+    """Base duration check with over-max billing tolerance.
 
-    - Fail if duration < MIN_MINUTES.
+    - Always fail if duration < MIN_MINUTES.
     - Pass if MIN_MINUTES <= duration <= MAX_MINUTES.
-    - Fail if duration > MAX_MINUTES.
+    - If duration > MAX_MINUTES, allow up to BILLING_TOL minutes over the max.
+      Only flag if it exceeds MAX_MINUTES + BILLING_TOL.
     """
     m = row["Actual Minutes"]
     if pd.isna(m):
         return False
 
-    return (m >= MIN_MINUTES) and (m <= MAX_MINUTES)
+    # Too short -> always fail (no tolerance below min)
+    if m < MIN_MINUTES:
+        return False
+
+    # Within base range -> OK
+    if m <= MAX_MINUTES:
+        return True
+
+    # Over max -> allow up to BILLING_TOL minutes over
+    over_by = m - MAX_MINUTES
+    if over_by <= BILLING_TOL:
+        return True
+
+    # More than BILLING_TOL minutes over -> fail
+    return False
 
 
 
