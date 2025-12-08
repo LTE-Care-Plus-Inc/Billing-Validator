@@ -886,7 +886,7 @@ with tab2:
 
     df_f["Failure Reasons"] = df_f.apply(get_failure_reasons, axis=1)
 
-    # ---------- Pretty-print signature time columns ----------
+    # ---------- Pretty-print signature columns (show date + time) ----------
     for col in [
         "Parent signature time",
         "User signature time",
@@ -894,9 +894,10 @@ with tab2:
         if col in df_f.columns:
             df_f[col] = (
                 pd.to_datetime(df_f[col], errors="coerce")
-                .dt.strftime("%I:%M:%S %p")
+                .dt.strftime("%m/%d/%Y %I:%M:%S %p")  # e.g. 11/29/2025 10:38:28 PM
                 .fillna("")
             )
+
 
     # ---------- Display ----------
     display_cols = [
