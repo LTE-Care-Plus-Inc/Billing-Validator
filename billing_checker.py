@@ -72,18 +72,78 @@ def pdf_bytes_to_text(pdf_bytes: bytes, preserve_layout: bool = True) -> str:
     return "".join(all_text)
 
 
+def normalize_session_time(raw: str) -> str:
+    if not raw:
+        return ""
+    raw = raw.strip()
+
+    # Already 12h with AM/PM
+    if re.search(r'\b(AM|PM)\b', raw, re.IGNORECASE):
+        parts = re.split(r'\s*-\s*', raw)
+        if len(parts) == 2:
+            return f"{parts[0].strip()} - {parts[1].strip()}"
+        return raw
+
+    # 24h range → convert
+    m = re.match(r'^\s*([0-9]{1,2}):([0-9]{2})\s*-\s*([0-9]{1,2}):([0-9]{2})\s*$', raw)
+    if not m:
+        return raw
+
+    h1, m1, h2, m2 = map(int, m.groups())
+
+    def to_12h(h, minute):
+        ampm = "AM"
+        if h == 0:
+            h12 = 12
+        elif h < 12:
+            h12 = h
+        elif h == 12:
+            h12 = 12
+            ampm = "PM"
+        else:
+            h12 = h - 12
+            ampm = "PM"
+        return f"{h12}:{minute:02d} {ampm}"
+
+    return f"{to_12h(h1, m1)} - {to_12h(h2, m2)}"
+
+
+def normalize_date(raw: str) -> str:
+    """
+    Accepts:
+      - 2025/10/28  (YYYY/MM/DD)
+      - 10/28/2025  (MM/DD/YYYY)
+    Returns normalized 'YYYY/MM/DD' when possible, else the stripped raw string.
+    """
+    if not raw:
+        return ""
+
+    raw = raw.strip()
+    m = re.match(r'^(\d{1,4})/(\d{1,2})/(\d{1,4})$', raw)
+    if not m:
+        return raw  # unexpected format, just return as-is
+
+    a, b, c = m.groups()
+    a_i, b_i, c_i = int(a), int(b), int(c)
+
+    # Case 1: YYYY/MM/DD
+    if len(a) == 4:
+        year, month, day = a_i, b_i, c_i
+    # Case 2: MM/DD/YYYY
+    elif len(c) == 4:
+        year, month, day = c_i, a_i, b_i
+    else:
+        # fallback: assume last is year
+        year, month, day = c_i, a_i, b_i
+
+    return f"{year:04d}/{month:02d}/{day:02d}"
+
+
 def parse_notes(text: str):
     """
     Parse client notes from text extracted from PDF.
-    Returns a list of dicts with at least:
-      - Client
-      - Rendering Provider
-      - Date
-      - Session Time
     """
-    # Split notes by "Client:" (but keep the keyword)
     blocks = re.split(r"(?=Client:)", text)
-
     results = []
 
     for block in blocks:
@@ -91,47 +151,45 @@ def parse_notes(text: str):
         if not block:
             continue
 
-        # ----------------------------
-        # Client Name
-        # ----------------------------
+        # ----- Client -----
         client_match = re.search(r"Client:\s*([^\n,]+)", block)
         client_name = client_match.group(1).strip() if client_match else ""
-
         if not client_name:
             continue
 
-        # ----------------------------
-        # Rendering Provider
-        # ----------------------------
+        # ----- Rendering Provider -----
         provider_match = re.search(r"Rendering Provider:\s*([^\n]+)", block)
         provider = provider_match.group(1).strip() if provider_match else ""
 
-        # ----------------------------
-        # Date (YYYY/MM/DD)
-        # ----------------------------
-        date_match = re.search(r"Date:\s*([0-9]{4}/[0-9]{2}/[0-9]{2})", block)
-        date_value = date_match.group(1) if date_match else ""
+        # ----- Date (loose: any n/n/n after 'Date:') -----
+        date_match = re.search(
+            r"Date\s*:\s*([0-9]{1,4}/[0-9]{1,2}/[0-9]{1,4})",
+            block,
+        )
+        raw_date = date_match.group(1) if date_match else ""
+        date_value = normalize_date(raw_date) if raw_date else ""
 
-        # ----------------------------
-        # Session Time
-        # - if just "-" or blank → ""
-        # - if real time range → keep it
-        # ----------------------------
+        # ----- Session Time -----
         session_time_match = re.search(
-            r"Session Time:\s*(?:"
+            r"Session Time\s*:\s*(?:"
             r"([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM)?\s*-\s*[0-9]{1,2}:[0-9]{2}\s*(?:AM|PM)?)"
-            r"|-"  # OR literal dash
+            r"|-"  # or "-"
             r")?",
             block,
             re.IGNORECASE,
         )
+        raw_session_time = session_time_match.group(1) if session_time_match else ""
+        session_time = normalize_session_time(raw_session_time or "")
 
-        if session_time_match:
-            session_time = session_time_match.group(1)
-            if session_time is None:
-                session_time = ""
-        else:
-            session_time = ""
+        # ----- Present at session (multi-line safe) -----
+        present_text = ""
+        pos = block.lower().find("present at session")
+        if pos != -1:
+            present_text = block[pos:pos + 400]  # chunk that includes bullets/lines
+
+        present_client = "client" in present_text.lower()
+        present_parent = "parent/caregiver" in present_text.lower()
+        present_bt = "bt/rbt" in present_text.lower()
 
         results.append(
             {
@@ -139,11 +197,13 @@ def parse_notes(text: str):
                 "Rendering Provider": provider,
                 "Date": date_value,
                 "Session Time": session_time,
+                "Present_Client": present_client,
+                "Present_ParentCaregiver": present_parent,
+                "Present_BT_RBT": present_bt,
             }
         )
 
     return results
-
 
 def notes_to_excel_bytes(results, sheet_name="Notes") -> bytes:
     """
@@ -317,6 +377,13 @@ with st.sidebar.expander("Duration / Billing Settings", expanded=False):
             "it will still be treated as OK."
         ),
     )
+    DAILY_TOL = st.number_input(
+        "Daily 8-hour limit tolerance (minutes)",
+        value=8,
+        min_value=0,
+        step=1,
+        help="How many extra minutes a BT can work over 8 hours in one day before it is flagged."
+    )
 
 # BT Contacts (optional) – used in Session Checker tab
 st.sidebar.header("BT Contacts (optional)")
@@ -452,12 +519,15 @@ with tab1:
                 with st.expander("Preview parsed notes", expanded=False):
                     st.dataframe(notes_df.head(50))
 
-                # Save external session list (Client, Session Time) into session_state
-                ext_df = notes_df[["Client", "Session Time"]].copy()
+                cols = ["Client", "Session Time", "Present_Client", "Present_ParentCaregiver", "Present_BT_RBT"]
+                existing_cols = [c for c in cols if c in notes_df.columns]
+
+                ext_df = notes_df[existing_cols].copy()
                 ext_df = normalize_cols(ext_df)
 
                 # Keep rows where Client is present, but DO NOT filter out blank Session Time
                 ext_df = ext_df[ext_df["Client"].notna()]
+
 
                 st.session_state["external_sessions_df"] = ext_df
 
@@ -534,6 +604,25 @@ def external_match_ok(row) -> bool:
         return True
     return bool(row["Has External Session"])
 
+def note_attendance_ok(row) -> bool:
+    """
+    Check whether the session note indicates all required 'Present at session' entries.
+    Uses the _Note_* flags populated from the external notes PDF.
+    If those columns don't exist / are NaN, this check is treated as passed.
+    """
+    flags = []
+    for col in ["_Note_ClientPresent", "_Note_ParentPresent", "_Note_BTPresent"]:
+        if col in row.index:
+            val = row[col]
+            if not pd.isna(val):
+                flags.append(bool(val))
+
+    # If we have no info at all, don't fail the row just for that
+    if not flags:
+        return True
+
+    return all(flags)
+
 
 def sig_ok_base(row) -> bool:
     """
@@ -591,7 +680,7 @@ def daily_total_ok(row) -> bool:
     m = row.get("Daily Minutes")
     if pd.isna(m):
         return True
-    return m <= DAILY_MAX_MINUTES
+    return m <= (DAILY_MAX_MINUTES + DAILY_TOL)
 
 
 # Combined evaluation (uses checkbox + override)
@@ -602,18 +691,16 @@ def evaluate_row(row) -> dict:
       - sig_ok
       - ext_ok
       - daily_ok
+      - note_ok
       - has_time_adj_sig
       - overall_pass
-    Applies override logic when checkbox is ON:
-      - If USE_TIME_ADJ_OVERRIDE and row has second parent signature:
-          signature issues are ignored (sig_ok = True)
-      - Duration and daily limits are ALWAYS enforced.
     """
     dur_base = duration_ok_base(row)
     sig_base = sig_ok_base(row)
     ext_ok = external_match_ok(row)
     adj_sig = has_time_adjust_sig(row)
     daily_ok_val = daily_total_ok(row)
+    note_ok_val = note_attendance_ok(row)
 
     # Start from base
     duration_ok = dur_base
@@ -623,18 +710,21 @@ def evaluate_row(row) -> dict:
     if USE_TIME_ADJ_OVERRIDE and adj_sig:
         sig_ok = True
 
-    overall = duration_ok and sig_ok and ext_ok and daily_ok_val
+    overall = duration_ok and sig_ok and ext_ok and daily_ok_val and note_ok_val
 
     return {
         "duration_ok": duration_ok,
         "sig_ok": sig_ok,
         "ext_ok": ext_ok,
         "daily_ok": daily_ok_val,
+        "note_ok": note_ok_val,
         "has_time_adj_sig": adj_sig,
         "overall_pass": overall,
         "duration_ok_base": dur_base,
         "sig_ok_base": sig_base,
     }
+
+
 
 
 def get_failure_reasons(row) -> str:
@@ -673,7 +763,27 @@ def get_failure_reasons(row) -> str:
         if not pd.isna(daily_min):
             reasons.append(
                 f"Total daily duration for this BT on {row.get('Date')} "
-                f"({daily_min:.0f} min) exceeds {DAILY_MAX_MINUTES} min"
+                f"({daily_min:.0f} min) exceeds {DAILY_MAX_MINUTES} min "
+                f"+ {DAILY_TOL} min tolerance"
+            )
+        # Note attendance failures
+    if not eval_res.get("note_ok", True):
+        missing = []
+        if "_Note_ClientPresent" in row.index and not bool(row["_Note_ClientPresent"]):
+            missing.append("Client")
+        if "_Note_ParentPresent" in row.index and not bool(row["_Note_ParentPresent"]):
+            missing.append("Parent/Caregiver")
+        if "_Note_BTPresent" in row.index and not bool(row["_Note_BTPresent"]):
+            missing.append("BT/RBT")
+
+        if missing:
+            reasons.append(
+                "Session note missing 'Present at session' entry for: " + ", ".join(missing)
+            )
+        else:
+            # Generic fallback if flags weren't available but note_ok still failed
+            reasons.append(
+                "Session note missing required 'Present at session' information"
             )
 
     return "; ".join(reasons) if reasons else "PASS"
@@ -775,13 +885,27 @@ with tab2:
             # In the HiRasmus dataframe, assign per-client order index
             df_f["SessionIndex"] = df_f.groupby("Client Name").cumcount()
 
-            # Merge on (Client Name, SessionIndex) WITHOUT changing df_f order
+            merge_cols = ["Client Name", "SessionIndex", "Session Time",
+                      "Present_Client", "Present_ParentCaregiver", "Present_BT_RBT"]
+            merge_cols = [c for c in merge_cols if c in ext_df.columns]
+
             df_f = df_f.merge(
-                ext_df[["Client Name", "SessionIndex", "Session Time"]],
+                ext_df[merge_cols],
                 on=["Client Name", "SessionIndex"],
                 how="left",
                 sort=False,
             )
+
+            # Map Present_* from external notes into internal _Note_* flags
+            for src, dst in [
+                ("Present_Client", "_Note_ClientPresent"),
+                ("Present_ParentCaregiver", "_Note_ParentPresent"),
+                ("Present_BT_RBT", "_Note_BTPresent"),
+            ]:
+                if src in df_f.columns:
+                    df_f[dst] = df_f[src].fillna(False).astype(bool)
+                else:
+                    df_f[dst] = np.nan
 
             # True if this HiRasmus row has a matching external session record
             df_f["Has External Session"] = df_f["Session Time"].notna()
@@ -875,14 +999,18 @@ with tab2:
         df_f["_ExtOk"] = eval_results["ext_ok"]
         df_f["_DailyOk"] = eval_results["daily_ok"]
         df_f["_HasTimeAdjSig"] = eval_results["has_time_adj_sig"]
+        df_f["_NoteOk"] = eval_results["note_ok"]
         df_f["_OverallPass"] = eval_results["overall_pass"]
+
     else:
         df_f["_DurationOk"] = eval_results.apply(lambda r: r["duration_ok"])
         df_f["_SigOk"] = eval_results.apply(lambda r: r["sig_ok"])
         df_f["_ExtOk"] = eval_results.apply(lambda r: r["ext_ok"])
         df_f["_DailyOk"] = eval_results.apply(lambda r: r["daily_ok"])
         df_f["_HasTimeAdjSig"] = eval_results.apply(lambda r: r["has_time_adj_sig"])
+        df_f["_NoteOk"] = eval_results.apply(lambda r: r["note_ok"])
         df_f["_OverallPass"] = eval_results.apply(lambda r: r["overall_pass"])
+        
 
     df_f["Failure Reasons"] = df_f.apply(get_failure_reasons, axis=1)
 
@@ -926,6 +1054,7 @@ with tab2:
             "_ExtOk",
             "_DailyOk",
             "_HasTimeAdjSig",
+            "_NoteOk",
             "Failure Reasons",
         ]
     )
