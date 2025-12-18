@@ -23,10 +23,10 @@ st.title("HiRasmus Billing Session Checker")
 STATUS_REQUIRED = "Transferred to AlohaABA"
 SESSION_REQUIRED = "1:1 BT Direct Service"
 
-MIN_MINUTES = 60    # >= 1 hour
+MIN_MINUTES = 53    # >= 1 hour
 MAX_MINUTES = 360   # <= 6 hours
 BILLING_TOL_DEFAULT = 8      # up to 8 min over MAX allowed
-DAILY_MAX_MINUTES = 480      # <= 8 hours per BT per day
+DAILY_MAX_MINUTES = 480     # <= 8 hours per BT per day
 
 # Column name for time-adjustment parent approval signature
 TIME_ADJ_COL = "Parent’s Signature Approval for Time Adjustment signature"
@@ -359,7 +359,7 @@ with st.sidebar.expander("Signature Settings", expanded=False):
     )
     SIG_TOL_LATE = st.number_input(
         "Signature late tolerance (minutes, positive)",
-        value=480,
+        value=1440,
         min_value=0,
         step=1,
         help="Latest allowed time after session end (e.g., 30 means up to 30 minutes after).",
@@ -680,7 +680,8 @@ def daily_total_ok(row) -> bool:
     m = row.get("Daily Minutes")
     if pd.isna(m):
         return True
-    return m <= (DAILY_MAX_MINUTES + DAILY_TOL)
+    # BAD if >= threshold
+    return m < (DAILY_MAX_MINUTES + DAILY_TOL)
 
 
 # Combined evaluation (uses checkbox + override)
@@ -1174,6 +1175,7 @@ with tab3:
                     merged["Billing Status"] = merged.apply(classify_status, axis=1)
 
                     # Split into categories
+                    all_df = all_df = merged.copy()
                     billed_df = merged[merged["Billing Status"] == "Billed"]
                     unbilled_df = merged[merged["Billing Status"] == "Unbilled"]
                     nomatch_df = merged[merged["Billing Status"] == "No Match"]
@@ -1228,17 +1230,19 @@ with tab3:
                         if c in merged.columns
                     ]
 
+                    all_dl = all_df[dl_cols]
                     billed_dl = billed_df[dl_cols]
                     unbilled_clean_dl = unbilled_clean_df[dl_cols]
                     unbilled_flagged_dl = unbilled_flagged_df[dl_cols]
                     nomatch_dl = nomatch_df[dl_cols]
 
+                    xlsx_all = export_excel(all_df)
                     xlsx_billed = export_excel(billed_dl)
                     xlsx_unbilled_clean = export_excel(unbilled_clean_dl)
                     xlsx_unbilled_flagged = export_excel(unbilled_flagged_dl)
                     xlsx_nomatch = export_excel(nomatch_dl)
 
-                    c1, c2, c3, c4 = st.columns(4)
+                    c1, c2, c3, c4 , c5= st.columns(5)
                     with c1:
                         st.download_button(
                             "⬇️ Billed Sessions",
@@ -1263,3 +1267,10 @@ with tab3:
                             data=xlsx_nomatch,
                             file_name="no_match_sessions.xlsx",
                         )
+                    with c5:
+                        st.download_button(
+                            "⬇️ All Sessions",
+                            data=xlsx_all,
+                            file_name="all_sessions.xlsx",
+                        )
+
