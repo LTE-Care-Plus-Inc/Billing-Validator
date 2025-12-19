@@ -153,9 +153,11 @@ def normalize_date(raw: str) -> str:
 
 def parse_notes(text: str):
     """
-    Parse client notes from text extracted from PDF.
+    Parse ABA session notes from extracted PDF text
+    and enforce Medicaid / ABA compliance requirements.
     """
-    blocks = re.split(r"(?=Client:)", text)
+
+    blocks = re.split(r"(?=Client\s*:)", text)
     results = []
 
     for block in blocks:
@@ -163,70 +165,244 @@ def parse_notes(text: str):
         if not block:
             continue
 
-        # ----- Client -----
-        client_match = re.search(r"Client:\s*([^\n,]+)", block)
+        # =====================
+        # BASIC IDENTIFIERS
+        # =====================
+
+        client_match = re.search(r"Client\s*:\s*([^\n,]+)", block)
         client_name = client_match.group(1).strip() if client_match else ""
         if not client_name:
             continue
 
-        # ----- Rendering Provider -----
-        provider_match = re.search(r"Rendering Provider:\s*([^\n]+)", block)
+        provider_match = re.search(r"Rendering Provider\s*:\s*([^\n]+)", block)
         provider = provider_match.group(1).strip() if provider_match else ""
 
-        # ----- Date (loose: any n/n/n after 'Date:') -----
-        date_match = re.search(
-            r"Date\s*:\s*([0-9]{1,4}/[0-9]{1,2}/[0-9]{1,4})",
+        # =====================
+        # REQUIRED DEMOGRAPHICS
+        # =====================
+
+        dob_match = re.search(
+            r"Date of Birth\s*:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})",
             block,
         )
-        raw_date = date_match.group(1) if date_match else ""
-        date_value = normalize_date(raw_date) if raw_date else ""
+        dob = normalize_date(dob_match.group(1)) if dob_match else ""
 
-        # ----- Session Time -----
-        session_time_match = re.search(
-            r"Session Time\s*:\s*(?:"
-            r"([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM)?\s*-\s*[0-9]{1,2}:[0-9]{2}\s*(?:AM|PM)?)"
-            r"|-"  # or "-"
-            r")?",
+        gender_match = re.search(r"Gender\s*:\s*([A-Za-z]+)", block)
+        gender = gender_match.group(1).strip() if gender_match else ""
+
+        # ----- Diagnosis Code (ICD / IDC tolerant) -----
+        diagnosis = ""
+        dx_match = re.search(
+            r"Diagnosis Code\s*\(\s*(?:ICD|IDC)\s*[-\s]*10\s*\)\s*:\s*([A-Za-z0-9\.\s]+)",
             block,
-            re.IGNORECASE,
+            re.I,
+        )
+        if dx_match:
+            raw = dx_match.group(1)
+            icd_match = re.search(r"[A-Za-z]\d{2}(?:\.\d+)?", raw, re.I)
+            if icd_match:
+                diagnosis = icd_match.group(0).upper()
+
+        insurance_match = re.search(r"Primary Insurance\s*:\s*([^\n]+)", block)
+        primary_insurance = insurance_match.group(1).strip() if insurance_match else ""
+
+        ins_id_match = re.search(r"Insurance ID\s*:\s*([A-Z0-9]+)", block, re.I)
+        insurance_id = ins_id_match.group(1).strip() if ins_id_match else ""
+
+        # =====================
+        # SESSION DATE & TIME
+        # =====================
+
+        date_match = re.search(
+            r"Session Date\s*:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})",
+            block,
+        )
+        session_date = normalize_date(date_match.group(1)) if date_match else ""
+
+        session_time_match = re.search(
+            r"Session Time\s*:\s*([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM)?\s*-\s*[0-9]{1,2}:[0-9]{2}\s*(?:AM|PM)?)",
+            block,
+            re.I,
         )
         raw_session_time = session_time_match.group(1) if session_time_match else ""
 
-        # NEW: fallback for Chinese session time
         if not raw_session_time:
-            m_cn = re.search(
+            cn_match = re.search(
                 r"(上午|下午)\s*[0-9]{1,2}:[0-9]{2}\s*-\s*(上午|下午)\s*[0-9]{1,2}:[0-9]{2}",
-                block
+                block,
             )
-            if m_cn:
-                raw_session_time = m_cn.group(0)
+            if cn_match:
+                raw_session_time = cn_match.group(0)
 
-        session_time = normalize_session_time(raw_session_time or "")
+        session_time = normalize_session_time(raw_session_time) if raw_session_time else ""
 
-        # ----- Present at session (multi-line safe) -----
+        # =====================
+        # SESSION LOCATION
+        # =====================
+
+        location_match = re.search(r"Session Location\s*:\s*([^\n]+)", block)
+        session_location = location_match.group(1).strip() if location_match else ""
+
+        # =====================
+        # PRESENT AT SESSION
+        # =====================
+
         present_text = ""
         pos = block.lower().find("present at session")
         if pos != -1:
-            present_text = block[pos:pos + 400]  # chunk that includes bullets/lines
+            present_text = block[pos:pos + 400]
 
-        present_client = "client" in present_text.lower()
-        present_parent = "parent/caregiver" in present_text.lower()
-        present_bt = "bt/rbt" in present_text.lower()
+        present_client = bool(re.search(r"\bClient\b", present_text, re.I))
+        present_bt = bool(re.search(r"\b(BT/RBT|RBT/BT)\b", present_text, re.I))
+        present_caregiver = bool(re.search(r"\bAdult Caregiver\b", present_text, re.I))
 
-        results.append(
-            {
-                "Client": client_name,
-                "Rendering Provider": provider,
-                "Date": date_value,
-                "Session Time": session_time,
-                "Present_Client": present_client,
-                "Present_ParentCaregiver": present_parent,
-                "Present_BT_RBT": present_bt,
-            }
+        # =====================
+        # -------- MALADAPTIVE STATUS (ROBUST) --------
+        # =====================
+
+        maladaptive_section = ""
+        section_match = re.search(
+            r"Maladaptive Status\s*:\s*(.*?)(?:\n[A-Z][a-zA-Z ]+?:|\Z)",
+            block,
+            re.S,
+        )
+        if section_match:
+            maladaptive_section = section_match.group(1).strip()
+
+        maladaptive_behaviors = []
+
+        if maladaptive_section:
+            for line in maladaptive_section.splitlines():
+                clean = line.strip()
+                if not clean:
+                    continue
+
+                lower = clean.lower()
+
+                # Skip headers / narrative (name-agnostic)
+                if (
+                    lower.endswith(":")
+                    or "continues to display" in lower
+                    or "in the following areas" in lower
+                    or "maladaptive status" in lower
+                    or "other maladaptive behaviors" in lower
+                ):
+                    continue
+
+                # Remove bullets & PDF artifacts
+                clean = re.sub(r"[•▪◦\-–—\uf0b7\uf0a7]+", "", clean).strip()
+
+                # Ignore long narrative sentences UNLESS it's "Other"
+                if len(clean.split()) > 6 and not clean.lower().startswith("other"):
+                    continue
+
+                maladaptive_behaviors.append(clean.lower())
+
+        other_selected = any(
+            b == "other" or b.startswith("other ")
+            for b in maladaptive_behaviors
         )
 
-    return results
+        other_desc_match = re.search(
+            r"Other maladaptive behaviors\s*:\s*(.+)",
+            block,
+            re.I,
+        )
+        other_maladaptive_present = bool(
+            other_desc_match and other_desc_match.group(1).strip()
+        )
 
+        # =====================
+        # -------- SESSION DATA CHECK (MEASURABLE) --------
+        # =====================
+
+        data_rows = re.findall(
+            r"\n\s*([a-zA-Z][a-zA-Z\s]+?)\s+([0-9]+)\s+([0-9]+)",
+            block,
+        )
+        data_collected = len(data_rows) > 0
+
+        # =====================
+        # OUTCOME & ATTESTATION
+        # =====================
+
+        outcome_yes = bool(
+            re.search(r"Outcome of Treatment.*?:\s*Yes", block, re.I | re.S)
+        )
+
+        attestation_present = bool(
+            re.search(r"Attestation|I attest|Clinician Attests", block, re.I)
+        )
+
+        # =====================
+        # COMPLIANCE VALIDATION
+        # =====================
+
+        compliance_errors = []
+
+        if not dob:
+            compliance_errors.append("Missing DOB")
+        if not gender:
+            compliance_errors.append("Missing Gender")
+        if not diagnosis:
+            compliance_errors.append("Missing ICD-10")
+        if diagnosis and len(diagnosis) < 3:
+            compliance_errors.append("Invalid ICD-10 code (truncated)")
+        if not primary_insurance:
+            compliance_errors.append("Missing Primary Insurance")
+        if not insurance_id:
+            compliance_errors.append("Missing Insurance ID")
+        if not session_time:
+            compliance_errors.append("Missing Session Time")
+        if not session_location:
+            compliance_errors.append("Missing Session Location")
+
+        if not maladaptive_behaviors:
+            compliance_errors.append("No maladaptive behaviors listed")
+
+        if other_selected and not other_maladaptive_present:
+            compliance_errors.append(
+                "Other maladaptive behavior selected but no description provided"
+            )
+
+        if not data_collected:
+            compliance_errors.append("No measurable session data found")
+
+        if not outcome_yes:
+            compliance_errors.append("Outcome of Treatment not Yes")
+
+        if not attestation_present:
+            compliance_errors.append("Missing Attestation")
+
+        # =====================
+        # FINAL OUTPUT
+        # =====================
+
+        results.append({
+            "Client": client_name,
+            "Rendering Provider": provider,
+            "Session Date": session_date,
+            "Date of Birth": dob,
+            "Gender": gender,
+            "Diagnosis Code": diagnosis,
+            "Primary Insurance": primary_insurance,
+            "Insurance ID": insurance_id,
+            "Session Time": session_time,
+            "Session Location": session_location,
+            "Present_Client": present_client,
+            "Present_BT_RBT": present_bt,
+            "Present_Adult_Caregiver": present_caregiver,
+            "Maladaptive Behaviors": maladaptive_behaviors,
+            "Other Selected": other_selected,
+            "Other Maladaptive Provided": other_maladaptive_present,
+            "Outcome Yes": outcome_yes,
+            "Data Collected": data_collected,
+            "Attestation Present": attestation_present,
+            "Compliance Errors": compliance_errors,
+            "PASS": len(compliance_errors) == 0,
+        })
+
+    return results
 def notes_to_excel_bytes(results, sheet_name="Notes") -> bytes:
     """
     Convert parsed notes list[dict] → Excel file bytes.
@@ -850,7 +1026,7 @@ with tab2:
     global USE_TIME_ADJ_OVERRIDE
     USE_TIME_ADJ_OVERRIDE = st.toggle(
         f"Use '{TIME_ADJ_COL}' as a signature override (only for sessions that failed signature timing; duration & daily limit still enforced)",
-        value=True,
+        value=False,
     )
 
     # ---------- Read and normalize Sessions file ----------
