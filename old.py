@@ -212,6 +212,7 @@ def parse_notes(text: str):
         present_client = "client" in present_text.lower()
         present_parent = "parent/caregiver" in present_text.lower()
         present_bt = "bt/rbt" in present_text.lower()
+        present_sibling = "sibilings" in present_text.lower()
 
         results.append(
             {
@@ -221,6 +222,7 @@ def parse_notes(text: str):
                 "Session Time": session_time,
                 "Present_Client": present_client,
                 "Present_ParentCaregiver": present_parent,
+                "Present_Sibling": present_sibling,
                 "Present_BT_RBT": present_bt,
             }
         )
@@ -628,22 +630,33 @@ def external_match_ok(row) -> bool:
 
 def note_attendance_ok(row) -> bool:
     """
-    Check whether the session note indicates all required 'Present at session' entries.
-    Uses the _Note_* flags populated from the external notes PDF.
-    If those columns don't exist / are NaN, this check is treated as passed.
+    Attendance rule:
+    - Client MUST be present
+    - BT/RBT MUST be present
+    - EITHER Parent/Caregiver OR Sibling must be present
     """
-    flags = []
-    for col in ["_Note_ClientPresent", "_Note_ParentPresent", "_Note_BTPresent"]:
-        if col in row.index:
-            val = row[col]
-            if not pd.isna(val):
-                flags.append(bool(val))
 
-    # If we have no info at all, don't fail the row just for that
-    if not flags:
+    client_present = row.get("_Note_ClientPresent")
+    bt_present = row.get("_Note_BTPresent")
+    parent_present = row.get("_Note_ParentPresent")
+    sibling_present = row.get("_Note_SiblingPresent")
+
+    # If no attendance info exists at all, do not fail
+    if all(pd.isna(x) for x in [
+        client_present, bt_present, parent_present, sibling_present
+    ]):
         return True
 
-    return all(flags)
+    if not bool(client_present):
+        return False
+
+    if not bool(bt_present):
+        return False
+
+    if not (bool(parent_present) or bool(sibling_present)):
+        return False
+
+    return True
 
 
 def sig_ok_base(row) -> bool:
@@ -792,12 +805,18 @@ def get_failure_reasons(row) -> str:
         # Note attendance failures
     if not eval_res.get("note_ok", True):
         missing = []
-        if "_Note_ClientPresent" in row.index and not bool(row["_Note_ClientPresent"]):
+
+        if not bool(row.get("_Note_ClientPresent")):
             missing.append("Client")
-        if "_Note_ParentPresent" in row.index and not bool(row["_Note_ParentPresent"]):
-            missing.append("Parent/Caregiver")
-        if "_Note_BTPresent" in row.index and not bool(row["_Note_BTPresent"]):
+
+        if not bool(row.get("_Note_BTPresent")):
             missing.append("BT/RBT")
+
+        parent_ok = bool(row.get("_Note_ParentPresent"))
+        sibling_ok = bool(row.get("_Note_SiblingPresent"))
+
+    if not (parent_ok or sibling_ok):
+        missing.append("Parent/Caregiver or Sibling")
 
         if missing:
             reasons.append(
@@ -908,8 +927,15 @@ with tab2:
             # In the HiRasmus dataframe, assign per-client order index
             df_f["SessionIndex"] = df_f.groupby("Client Name").cumcount()
 
-            merge_cols = ["Client Name", "SessionIndex", "Session Time",
-                      "Present_Client", "Present_ParentCaregiver", "Present_BT_RBT"]
+            merge_cols = [
+                "Client Name",
+                "SessionIndex",
+                "Session Time",
+                "Present_Client",
+                "Present_ParentCaregiver",
+                "Present_Sibling",
+                "Present_BT_RBT",
+            ]
             merge_cols = [c for c in merge_cols if c in ext_df.columns]
 
             df_f = df_f.merge(
@@ -923,8 +949,10 @@ with tab2:
             for src, dst in [
                 ("Present_Client", "_Note_ClientPresent"),
                 ("Present_ParentCaregiver", "_Note_ParentPresent"),
+                ("Present_Sibling", "_Note_SiblingPresent"),
                 ("Present_BT_RBT", "_Note_BTPresent"),
             ]:
+
                 if src in df_f.columns:
                     df_f[dst] = df_f[src].fillna(False).astype(bool)
                 else:

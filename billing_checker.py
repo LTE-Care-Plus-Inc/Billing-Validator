@@ -259,6 +259,9 @@ def parse_notes(text: str):
         present_client = bool(re.search(r"\bClient\b", present_text, re.I))
         present_bt = bool(re.search(r"\b(BT/RBT|RBT/BT)\b", present_text, re.I))
         present_caregiver = bool(re.search(r"\bAdult Caregiver\b", present_text, re.I))
+        present_sibling = bool(
+    re.search(r"\bSibling(s)?\b", present_text, re.I)
+)
 
         # =====================
         # -------- MALADAPTIVE STATUS (ROBUST) --------
@@ -396,6 +399,7 @@ def parse_notes(text: str):
             "Present_Client": present_client,
             "Present_BT_RBT": present_bt,
             "Present_Adult_Caregiver": present_caregiver,
+            "Present_Sibling": present_sibling,
             "Maladaptive Behaviors": maladaptive_behaviors,
             "Other Selected": other_selected,
             "Other Maladaptive Provided": other_maladaptive_present,
@@ -808,22 +812,34 @@ def external_match_ok(row) -> bool:
 
 def note_attendance_ok(row) -> bool:
     """
-    Check whether the session note indicates all required 'Present at session' entries.
-    Uses the _Note_* flags populated from the external notes PDF.
-    If those columns don't exist / are NaN, this check is treated as passed.
+    Attendance rule:
+    - Client MUST be present
+    - BT/RBT MUST be present
+    - EITHER Parent/Caregiver OR Sibling must be present (both is fine)
     """
-    flags = []
-    for col in ["_Note_ClientPresent", "_Note_ParentPresent", "_Note_BTPresent"]:
-        if col in row.index:
-            val = row[col]
-            if not pd.isna(val):
-                flags.append(bool(val))
 
-    # If we have no info at all, don't fail the row just for that
-    if not flags:
+    client_present = row.get("_Note_ClientPresent")
+    bt_present = row.get("_Note_BTPresent")
+    parent_present = row.get("_Note_ParentPresent")
+    sibling_present = row.get("_Note_SiblingPresent")
+
+    # If we have no attendance info at all, don't fail the row
+    if all(pd.isna(x) for x in [client_present, bt_present, parent_present, sibling_present]):
         return True
 
-    return all(flags)
+    # Required
+    if not bool(client_present):
+        return False
+
+    if not bool(bt_present):
+        return False
+
+    # Either Parent OR Sibling must be present
+    if not (bool(parent_present) or bool(sibling_present)):
+        return False
+
+    return True
+
 
 
 def sig_ok_base(row) -> bool:
@@ -972,22 +988,23 @@ def get_failure_reasons(row) -> str:
         # Note attendance failures
     if not eval_res.get("note_ok", True):
         missing = []
+
         if "_Note_ClientPresent" in row.index and not bool(row["_Note_ClientPresent"]):
             missing.append("Client")
-        if "_Note_ParentPresent" in row.index and not bool(row["_Note_ParentPresent"]):
-            missing.append("Parent/Caregiver")
+
         if "_Note_BTPresent" in row.index and not bool(row["_Note_BTPresent"]):
             missing.append("BT/RBT")
 
-        if missing:
-            reasons.append(
-                "Session note missing 'Present at session' entry for: " + ", ".join(missing)
-            )
-        else:
-            # Generic fallback if flags weren't available but note_ok still failed
-            reasons.append(
-                "Session note missing required 'Present at session' information"
-            )
+        parent_ok = bool(row.get("_Note_ParentPresent"))
+        sibling_ok = bool(row.get("_Note_SiblingPresent"))
+
+        if not (parent_ok or sibling_ok):
+            missing.append("Parent/Caregiver or Sibling")
+
+        reasons.append(
+            "Session note attendance issue: missing " + ", ".join(missing)
+        )
+
 
     return "; ".join(reasons) if reasons else "PASS"
 
@@ -1103,6 +1120,7 @@ with tab2:
             for src, dst in [
                 ("Present_Client", "_Note_ClientPresent"),
                 ("Present_ParentCaregiver", "_Note_ParentPresent"),
+                ("Present_Sibling", "_Note_SiblingPresent"),
                 ("Present_BT_RBT", "_Note_BTPresent"),
             ]:
                 if src in df_f.columns:
@@ -1359,6 +1377,58 @@ with tab3:
                         how="left",
                         sort=False,
                     )
+                    # ---------- Clean up name columns for Tab 3 ----------
+                    cols_to_drop = [c for c in ["Client", "User"] if c in merged.columns]
+                    merged = merged.drop(columns=cols_to_drop)
+
+                    # ---------- Reorder columns for Tab 3 ----------
+                    desired_order = [
+                        "Status",
+                        "Date/Time",
+                        "End time",
+                        "Duration",
+                        "Activity type",
+                        "Session",
+                        "AlohaABA Appointment ID",
+                        "Parent signature time",
+                        "User signature time",
+                        "Start date",
+                        "Actual Minutes",
+                        "Date",
+                        "_End_dt",
+                        "_ParentSig_dt",
+                        "_UserSig_dt",
+                        "Client Name",
+                        "SessionIndex",
+                        "Session Time",
+                        "Present_Client",
+                        "Present_BT_RBT",
+                        "_Note_ClientPresent",
+                        "_Note_ParentPresent",
+                        "_Note_BTPresent",
+                        "Has External Session",
+                        "_ExtStart_dt",
+                        "_ExtEnd_dt",
+                        "Phone",
+                        "Email",
+                        "Daily Minutes",
+                        "_DurationOk",
+                        "_SigOk",
+                        "_ExtOk",
+                        "_DailyOk",
+                        "_HasTimeAdjSig",
+                        "_NoteOk",
+                        "_OverallPass",
+                        "Failure Reasons",
+                        "Appointment ID",
+                        "Date Billed",
+                        "Billing Status",
+                    ]
+
+                    # Keep only columns that actually exist, in the desired order
+                    ordered_cols = [c for c in desired_order if c in merged.columns]
+                    merged = merged[ordered_cols]
+
 
                     # Classify billing status per row
                     def classify_status(row):
