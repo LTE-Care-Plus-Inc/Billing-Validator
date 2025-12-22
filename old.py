@@ -802,31 +802,28 @@ def get_failure_reasons(row) -> str:
                 f"({daily_min:.0f} min) exceeds {DAILY_MAX_MINUTES} min "
                 f"+ {DAILY_TOL} min tolerance"
             )
-        # Note attendance failures
+    # Note attendance failures
+ # Note attendance failures
     if not eval_res.get("note_ok", True):
         missing = []
 
-        if not bool(row.get("_Note_ClientPresent")):
-            missing.append("Client")
-
-        if not bool(row.get("_Note_BTPresent")):
-            missing.append("BT/RBT")
-
+        client_ok = bool(row.get("_Note_ClientPresent"))
+        bt_ok = bool(row.get("_Note_BTPresent"))
         parent_ok = bool(row.get("_Note_ParentPresent"))
         sibling_ok = bool(row.get("_Note_SiblingPresent"))
 
-    if not (parent_ok or sibling_ok):
-        missing.append("Parent/Caregiver or Sibling")
+        if not client_ok:
+            missing.append("Client")
 
-        if missing:
-            reasons.append(
-                "Session note missing 'Present at session' entry for: " + ", ".join(missing)
-            )
-        else:
-            # Generic fallback if flags weren't available but note_ok still failed
-            reasons.append(
-                "Session note missing required 'Present at session' information"
-            )
+        if not bt_ok:
+            missing.append("BT/RBT")
+
+        if not (parent_ok or sibling_ok):
+            missing.append("Parent/Caregiver or Sibling")
+
+        reasons.append(
+            "Session note attendance issue: missing " + ", ".join(missing)
+        )
 
     return "; ".join(reasons) if reasons else "PASS"
 
