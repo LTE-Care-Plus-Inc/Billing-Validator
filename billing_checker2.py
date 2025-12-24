@@ -73,6 +73,10 @@ def pdf_bytes_to_text(pdf_bytes: bytes, preserve_layout: bool = True) -> str:
 
 
 def normalize_session_time(raw: str) -> str:
+
+    raw = re.sub(r'\b(a\.m\.|am)\b', 'AM', raw, flags=re.I)
+    raw = re.sub(r'\b(p\.m\.|pm)\b', 'PM', raw, flags=re.I)
+    
     if not raw:
         return ""
 

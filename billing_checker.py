@@ -3,7 +3,7 @@ import re
 from typing import Any
 from difflib import SequenceMatcher
 
-import fitz  
+import fitz
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -44,6 +44,7 @@ REQ_COLS = [
     "Start date",   # mandatory date column from HiRasmus
 ]
 
+DATE_RE = r"(\d{1,4}/\d{1,2}/\d{1,4})"
 # -----------------------------
 # PDF → TEXT (TOOLS TAB)
 # -----------------------------
@@ -73,10 +74,9 @@ def pdf_bytes_to_text(pdf_bytes: bytes, preserve_layout: bool = True) -> str:
 
 
 def normalize_session_time(raw: str) -> str:
+    raw = re.sub(r"\b(a\.m\.|am)\b", "AM", raw, flags=re.I)
+    raw = re.sub(r"\b(p\.m\.|pm)\b", "PM", raw, flags=re.I)
 
-    raw = re.sub(r'\b(a\.m\.|am)\b', 'AM', raw, flags=re.I)
-    raw = re.sub(r'\b(p\.m\.|pm)\b', 'PM', raw, flags=re.I)
-    
     if not raw:
         return ""
 
@@ -90,16 +90,16 @@ def normalize_session_time(raw: str) -> str:
         raw = re.sub(r"\s+", " ", raw).strip()
 
     # Already 12h with AM/PM
-    if re.search(r'\b(AM|PM)\b', raw, re.IGNORECASE):
-        parts = re.split(r'\s*-\s*', raw)
+    if re.search(r"\b(AM|PM)\b", raw, re.IGNORECASE):
+        parts = re.split(r"\s*-\s*", raw)
         if len(parts) == 2:
             return f"{parts[0].strip()} - {parts[1].strip()}"
         return raw
 
     # 24h range → convert
     m = re.match(
-        r'^\s*([0-9]{1,2}):([0-9]{2})\s*-\s*([0-9]{1,2}):([0-9]{2})\s*$',
-        raw
+        r"^\s*([0-9]{1,2}):([0-9]{2})\s*-\s*([0-9]{1,2}):([0-9]{2})\s*$",
+        raw,
     )
     if not m:
         return raw
@@ -123,7 +123,6 @@ def normalize_session_time(raw: str) -> str:
     return f"{to_12h(h1, m1)} - {to_12h(h2, m2)}"
 
 
-
 def normalize_date(raw: str) -> str:
     """
     Accepts:
@@ -135,21 +134,18 @@ def normalize_date(raw: str) -> str:
         return ""
 
     raw = raw.strip()
-    m = re.match(r'^(\d{1,4})/(\d{1,2})/(\d{1,4})$', raw)
+    m = re.match(r"^(\d{1,4})/(\d{1,2})/(\d{1,4})$", raw)
     if not m:
-        return raw  # unexpected format, just return as-is
+        return raw
 
     a, b, c = m.groups()
     a_i, b_i, c_i = int(a), int(b), int(c)
 
-    # Case 1: YYYY/MM/DD
-    if len(a) == 4:
+    if len(a) == 4:           # YYYY/MM/DD
         year, month, day = a_i, b_i, c_i
-    # Case 2: MM/DD/YYYY
-    elif len(c) == 4:
+    elif len(c) == 4:         # MM/DD/YYYY
         year, month, day = c_i, a_i, b_i
-    else:
-        # fallback: assume last is year
+    else:                      # fallback
         year, month, day = c_i, a_i, b_i
 
     return f"{year:04d}/{month:02d}/{day:02d}"
@@ -157,10 +153,9 @@ def normalize_date(raw: str) -> str:
 
 def parse_notes(text: str):
     """
-    Parse ABA session notes from extracted PDF text
-    and enforce Medicaid / ABA compliance requirements.
+    Parse ABA session notes from extracted PDF text and enforce compliance.
+    NOTE: Attendance is enforced here so Tab 2 can rely on Note Parse PASS only.
     """
-
     blocks = re.split(r"(?=Client\s*:)", text)
     results = []
 
@@ -173,7 +168,8 @@ def parse_notes(text: str):
         # BASIC IDENTIFIERS
         # =====================
 
-        client_match = re.search(r"Client\s*:\s*([^\n,]+)", block)
+        # IMPORTANT FIX: do NOT stop at comma; many PDFs show "Last, First"
+        client_match = re.search(r"Client\s*:\s*([^\n]+)", block)
         client_name = client_match.group(1).strip() if client_match else ""
         if not client_name:
             continue
@@ -185,16 +181,23 @@ def parse_notes(text: str):
         # REQUIRED DEMOGRAPHICS
         # =====================
 
-        dob_match = re.search(
-            r"Date of Birth\s*:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})",
-            block,
-        )
+        dob_match = re.search(rf"Date of Birth\s*:\s*{DATE_RE}", block, re.I)
         dob = normalize_date(dob_match.group(1)) if dob_match else ""
 
-        gender_match = re.search(r"Gender\s*:\s*([A-Za-z]+)", block)
-        gender = gender_match.group(1).strip() if gender_match else ""
 
-        # ----- Diagnosis Code (ICD / IDC tolerant) -----
+        gender_match = re.search(r"Gender\s*:\s*([^\n\r]+)", block, re.I)
+        gender_raw = gender_match.group(1).strip() if gender_match else ""
+
+        # Normalize gender values
+        g = gender_raw.strip().lower()
+        if g in ("male", "m", "man", "boy", "男性", "男"):
+            gender = "Male"
+        elif g in ("female", "f", "woman", "girl", "女性", "女"):
+            gender = "Female"
+        else:
+            gender = gender_raw  # keep whatever is provided
+
+        # Diagnosis Code (ICD / IDC tolerant)
         diagnosis = ""
         dx_match = re.search(
             r"Diagnosis Code\s*\(\s*(?:ICD|IDC)\s*[-\s]*10\s*\)\s*:\s*([A-Za-z0-9\.\s]+)",
@@ -217,11 +220,9 @@ def parse_notes(text: str):
         # SESSION DATE & TIME
         # =====================
 
-        date_match = re.search(
-            r"Session Date\s*:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})",
-            block,
-        )
+        date_match = re.search(rf"Session Date\s*:\s*{DATE_RE}", block, re.I)
         session_date = normalize_date(date_match.group(1)) if date_match else ""
+
 
         session_time_match = re.search(
             r"Session Time\s*:\s*([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM)?\s*-\s*[0-9]{1,2}:[0-9]{2}\s*(?:AM|PM)?)",
@@ -254,17 +255,15 @@ def parse_notes(text: str):
         present_text = ""
         pos = block.lower().find("present at session")
         if pos != -1:
-            present_text = block[pos:pos + 400]
+            present_text = block[pos : pos + 400]
 
         present_client = bool(re.search(r"\bClient\b", present_text, re.I))
         present_bt = bool(re.search(r"\b(BT/RBT|RBT/BT)\b", present_text, re.I))
         present_caregiver = bool(re.search(r"\bAdult Caregiver\b", present_text, re.I))
-        present_sibling = bool(
-    re.search(r"\bSibling(s)?\b", present_text, re.I)
-)
+        present_sibling = bool(re.search(r"\bSibling(s)?\b", present_text, re.I))
 
         # =====================
-        # -------- MALADAPTIVE STATUS (ROBUST) --------
+        # MALADAPTIVE STATUS
         # =====================
 
         maladaptive_section = ""
@@ -277,7 +276,6 @@ def parse_notes(text: str):
             maladaptive_section = section_match.group(1).strip()
 
         maladaptive_behaviors = []
-
         if maladaptive_section:
             for line in maladaptive_section.splitlines():
                 clean = line.strip()
@@ -285,8 +283,6 @@ def parse_notes(text: str):
                     continue
 
                 lower = clean.lower()
-
-                # Skip headers / narrative (name-agnostic)
                 if (
                     lower.endswith(":")
                     or "continues to display" in lower
@@ -296,31 +292,20 @@ def parse_notes(text: str):
                 ):
                     continue
 
-                # Remove bullets & PDF artifacts
                 clean = re.sub(r"[•▪◦\-–—\uf0b7\uf0a7]+", "", clean).strip()
 
-                # Ignore long narrative sentences UNLESS it's "Other"
                 if len(clean.split()) > 6 and not clean.lower().startswith("other"):
                     continue
 
                 maladaptive_behaviors.append(clean.lower())
 
-        other_selected = any(
-            b == "other" or b.startswith("other ")
-            for b in maladaptive_behaviors
-        )
+        other_selected = any(b == "other" or b.startswith("other ") for b in maladaptive_behaviors)
 
-        other_desc_match = re.search(
-            r"Other maladaptive behaviors\s*:\s*(.+)",
-            block,
-            re.I,
-        )
-        other_maladaptive_present = bool(
-            other_desc_match and other_desc_match.group(1).strip()
-        )
+        other_desc_match = re.search(r"Other maladaptive behaviors\s*:\s*(.+)", block, re.I)
+        other_maladaptive_present = bool(other_desc_match and other_desc_match.group(1).strip())
 
         # =====================
-        # -------- SESSION DATA CHECK (MEASURABLE) --------
+        # SESSION DATA CHECK
         # =====================
 
         data_rows = re.findall(
@@ -330,16 +315,40 @@ def parse_notes(text: str):
         data_collected = len(data_rows) > 0
 
         # =====================
-        # OUTCOME & ATTESTATION
+        # ATTESTATION & SIGNATURE
         # =====================
 
-        outcome_yes = bool(
-            re.search(r"Outcome of Treatment.*?:\s*Yes", block, re.I | re.S)
+        provider_signature_present = bool(
+            re.search(r"Provider\s+Signatures/Credentials\s+and\s+Date\s*:", block, re.I)
         )
 
-        attestation_present = bool(
-            re.search(r"Attestation|I attest|Clinician Attests", block, re.I)
+        provider_signature_valid = bool(
+            re.search(
+                r"Provider\s+Signatures/Credentials\s+and\s+Date\s*:\s*"
+                r"[A-Za-z][A-Za-z\s\-']+,\s*(?:BT|RBT)\s*,\s*"
+                r"[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}",
+                block,
+                re.I,
+            )
         )
+
+        bt_attestation_present = bool(
+            re.search(
+                r"\battest\s+that\s+the\s+session\s+summary\s+is\s+accurate\s+and\s+correct\b",
+                block,
+                re.I,
+            )
+        )
+
+        revision_attestation_present = bool(
+            re.search(
+                r"I\s+attest\s+the\s+revision/edit\s+made\s+to\s+this\s+note\s+as\s+signed\s+below\s+is\s+accurate\s+and\s+true",
+                block,
+                re.I,
+            )
+        )
+
+        outcome_yes = bool(re.search(r"Outcome of Treatment.*?:\s*Yes", block, re.I | re.S))
 
         # =====================
         # COMPLIANCE VALIDATION
@@ -368,9 +377,7 @@ def parse_notes(text: str):
             compliance_errors.append("No maladaptive behaviors listed")
 
         if other_selected and not other_maladaptive_present:
-            compliance_errors.append(
-                "Other maladaptive behavior selected but no description provided"
-            )
+            compliance_errors.append("Other maladaptive behavior selected but no description provided")
 
         if not data_collected:
             compliance_errors.append("No measurable session data found")
@@ -378,43 +385,57 @@ def parse_notes(text: str):
         if not outcome_yes:
             compliance_errors.append("Outcome of Treatment not Yes")
 
-        if not attestation_present:
-            compliance_errors.append("Missing Attestation")
+        if not bt_attestation_present:
+            compliance_errors.append("Missing BT/RBT attestation statement")
 
-        # =====================
-        # FINAL OUTPUT
-        # =====================
+        if not provider_signature_present:
+            compliance_errors.append("Missing provider signature section")
+        elif not provider_signature_valid:
+            compliance_errors.append("Provider signature present but invalid format (must include Name, BT/RBT, and date)")
 
-        results.append({
-            "Client": client_name,
-            "Rendering Provider": provider,
-            "Session Date": session_date,
-            "Date of Birth": dob,
-            "Gender": gender,
-            "Diagnosis Code": diagnosis,
-            "Primary Insurance": primary_insurance,
-            "Insurance ID": insurance_id,
-            "Session Time": session_time,
-            "Session Location": session_location,
-            "Present_Client": present_client,
-            "Present_BT_RBT": present_bt,
-            "Present_Adult_Caregiver": present_caregiver,
-            "Present_Sibling": present_sibling,
-            "Maladaptive Behaviors": maladaptive_behaviors,
-            "Other Selected": other_selected,
-            "Other Maladaptive Provided": other_maladaptive_present,
-            "Outcome Yes": outcome_yes,
-            "Data Collected": data_collected,
-            "Attestation Present": attestation_present,
-            "Compliance Errors": compliance_errors,
-            "PASS": len(compliance_errors) == 0,
-        })
+        # Attendance requirements (now enforced here)
+        if not present_client:
+            compliance_errors.append("Attendance: Client not present")
+        if not present_bt:
+            compliance_errors.append("Attendance: BT/RBT not present")
+        if not (present_caregiver or present_sibling):
+            compliance_errors.append("Attendance: Parent/Caregiver or Sibling not present")
+
+        results.append(
+            {
+                "Client": client_name,
+                "Rendering Provider": provider,
+                "Session Date": session_date,
+                "Date of Birth": dob,
+                "Gender": gender,
+                "Diagnosis Code": diagnosis,
+                "Primary Insurance": primary_insurance,
+                "Insurance ID": insurance_id,
+                "Session Time": session_time,
+                "Session Location": session_location,
+                "Present_Client": present_client,
+                "Present_BT_RBT": present_bt,
+                "Present_Adult_Caregiver": present_caregiver,
+                "Present_Sibling": present_sibling,
+                "Maladaptive Behaviors": maladaptive_behaviors,
+                "Other Selected": other_selected,
+                "Other Maladaptive Provided": other_maladaptive_present,
+                "Outcome Yes": outcome_yes,
+                "Data Collected": data_collected,
+                "BT Attestation Present": bt_attestation_present,
+                "Provider Signature Present": provider_signature_present,
+                "Provider Signature Valid": provider_signature_valid,
+                "Revision Attestation Present": revision_attestation_present,
+                "Compliance Errors": compliance_errors,
+                "PASS": len(compliance_errors) == 0,
+            }
+        )
 
     return results
+
+
 def notes_to_excel_bytes(results, sheet_name="Notes") -> bytes:
-    """
-    Convert parsed notes list[dict] → Excel file bytes.
-    """
+    """Convert list[dict] → Excel bytes."""
     df = pd.DataFrame(results)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -493,15 +514,14 @@ def within_time_tol(
 ) -> bool:
     if pd.isna(sig_ts) or pd.isna(base_ts):
         return False
-
     diff_min = (sig_ts - base_ts).total_seconds() / 60.0
     return (diff_min >= tol_early_min) and (diff_min <= tol_late_min)
 
 
 def normalize_name(name: Any) -> str:
     """
-    Normalize 'First Middle Last' -> 'Last, First Middle'
-    and proper-case each word.
+    Normalize names into: 'Last, First Middle' (proper-cased).
+    Handles already-comma format like 'Last, First'.
     """
     if pd.isna(name):
         return ""
@@ -509,26 +529,30 @@ def normalize_name(name: Any) -> str:
     if not s:
         return ""
 
+    def proper_case_block(block: str) -> str:
+        block = " ".join(block.split())
+        return " ".join(w.capitalize() for w in block.split())
+
+    if "," in s:
+        last, rest = [p.strip() for p in s.split(",", 1)]
+        last = proper_case_block(last)
+        rest = proper_case_block(rest)
+        return f"{last}, {rest}" if rest else last
+
     parts = s.split()
     if len(parts) == 1:
-        return parts[0].capitalize()
+        return proper_case_block(parts[0])
 
     last_raw = parts[-1]
     first_middle_raw = " ".join(parts[:-1])
-
-    def proper_case_block(block: str) -> str:
-        return " ".join(w.capitalize() for w in block.split())
-
     last = proper_case_block(last_raw)
     first_middle = proper_case_block(first_middle_raw)
-
     return f"{last}, {first_middle}"
 
 
 def parse_session_time_range(session_time: Any, base_date: Any):
     """
-    Parse '3:00 PM  -  9:00 PM' or '15:00  -  20:00' into (start_dt, end_dt),
-    using base_date for the date component.
+    Parse '3:00 PM - 9:00 PM' into (start_dt, end_dt), using base_date.
     """
     if pd.isna(session_time):
         return pd.NaT, pd.NaT
@@ -539,7 +563,6 @@ def parse_session_time_range(session_time: Any, base_date: Any):
 
     start_str, end_str = [part.strip() for part in text.split("-", 1)]
 
-    # Determine date string
     if pd.isna(base_date):
         date_str = "1900-01-01"
     else:
@@ -588,10 +611,10 @@ with st.sidebar.expander("Duration / Billing Settings", expanded=False):
         value=8,
         min_value=0,
         step=1,
-        help="How many extra minutes a BT can work over 8 hours in one day before it is flagged."
+        help="How many extra minutes a BT can work over 8 hours in one day before it is flagged.",
     )
 
-# BT Contacts (optional) – used in Session Checker tab
+# BT Contacts (optional)
 st.sidebar.header("BT Contacts (optional)")
 bt_contacts_file = st.sidebar.file_uploader(
     "Upload BT Contacts (BT Name, Phone, Email)",
@@ -606,91 +629,29 @@ with st.expander("Instructions", expanded=False):
 This tool reviews **BT 1:1 Direct Service sessions from HiRasmus** and checks whether each session meets
 core billing-compliance requirements.
 
-There are **two tabs** in this app:
+There are **three tabs** in this app:
 
 - **Tools – Extract External Sessions**: Upload the *Session Notes PDF* from HiRasmus.  
-  The app parses it and builds an **External Session List** (`Client`, `Session Time`) and stores it for use in the Session Checker.  
-  Rows with blank `Session Time` are **kept** (they just won’t count as a matched external session).
+  The app parses it and builds an **External Session List** and stores it for use in the Session Checker.
 
 - **Session Checker**: Upload the HiRasmus sessions Excel export and run all compliance checks.  
-  The checker automatically uses the External Session List from the Tools tab, unless you choose to override it
-  by uploading another external file.
+  **Notes are REQUIRED**. If a note fails parsing compliance, the session fails here.
 
----
+- **Billed Checker**: Upload Aloha billing status and see billed/unbilled/no-match.
 
-### 🔹 Files to Upload (Session Checker tab)
-
-1. **HiRasmus Sessions Export (Excel)**  
-   This file contains one row per BT session. It **must include** the following columns:
-
-   - `Status`  
-   - `Session`
-   - `Aloha Appointment ID`  
-   - `Client`  
-   - `User`  
-   - `Start date`  
-   - `Duration`  
-   - `Parent signature time`  
-   - `User signature time`  
-
-2. **(Optional) BT Contacts File**  
-   Uploaded via the **sidebar** as a CSV/Excel file with:
-
-   - `BT Name`  
-   - `Phone`  
-   - `Email`  
-
-   The app will fuzzy-match `BT Name` to the HiRasmus `User`/`Staff Name` and attach phone/email.
-
-3. **External Session List**  
-   By default this comes from the **Tools tab** when you upload the Session Notes PDF.  
-   You can also manually upload a file here to override it.
-
-   Required columns:
-
-   - `Client`  
-   - `Session Time`  
-
-   Notes:
-   - All rows with a valid `Client` are kept, even if `Session Time` is blank.  
-   - For each HiRasmus row, the app matches on **Client (normalized)** and **sequence/order** (first note, second note, etc.).  
-   - If a matched row has a **non-blank `Session Time`**, it is used to:
-     - mark `Has External Session = True`, and  
-     - override the session **start/end time** and **duration**.
-   - If the matched external row has a **blank `Session Time`**, it will **not** count as a valid external session for checks
-     and will behave like “no session time found”.
-
----
-
-### 🔹 Signature Timing & Overrides
-
-- Signature timing tolerance is controlled in the **sidebar**:
-  - **Early tolerance** (negative minutes, e.g. `-15`)
-  - **Late tolerance** (positive minutes, e.g. `30`)
-
-- You can enable an option to use  
-  **“Parent’s Signature Approval for Time Adjustment signature”**  
-  as an override:
-  - If enabled and that field is present on a row, **signature timing failures are ignored** for that row.
-  - **Duration rules and daily 8-hour limit are always enforced**.
-
-After all checks, the app:
-
-- Shows a detailed table with pass/fail indicators and reasons  
-- Excludes test client **“Marry Wang Demo”** from the final Excel exports  
-- Provides three downloads: **All**, **Passed Only**, and **Failed Only** sessions in Tab 2,  
-  and four billing files in Tab 3.
-        """
+"""
     )
 
 # -----------------------------
 # TABS
 # -----------------------------
-tab1, tab2, tab3 = st.tabs([
-    "1️⃣ Tools – Extract External Sessions",
-    "2️⃣ Session Checker",
-    "3️⃣ Billed Checker",
-])
+tab1, tab2, tab3 = st.tabs(
+    [
+        "1️⃣ Tools – Extract External Sessions",
+        "2️⃣ Session Checker",
+        "3️⃣ Billed Checker",
+    ]
+)
 
 # Keep external sessions DF across tabs
 if "external_sessions_df" not in st.session_state:
@@ -710,30 +671,40 @@ with tab1:
 
     if pdf_file is not None:
         try:
-            # Extract text (auto-run)
             text = pdf_bytes_to_text(pdf_file.read(), preserve_layout=True)
-
-            # Parse notes
             results = parse_notes(text)
+
             if not results:
                 st.warning("No notes found in the PDF. Make sure it contains 'Client:' blocks.")
             else:
                 notes_df = pd.DataFrame(results)
                 st.success(f"Parsed {len(notes_df)} notes from PDF.")
 
-                # Show notes preview in a toggle
                 with st.expander("Preview parsed notes", expanded=False):
                     st.dataframe(notes_df.head(50))
 
-                cols = ["Client", "Session Time", "Present_Client", "Present_ParentCaregiver", "Present_BT_RBT"]
+                cols = [
+                    "Client",
+                    "Session Time",
+                    "Present_Client",
+                    "Present_Adult_Caregiver",
+                    "Present_Sibling",
+                    "Present_BT_RBT",
+                    "PASS",
+                    "Compliance Errors",
+                ]
                 existing_cols = [c for c in cols if c in notes_df.columns]
 
                 ext_df = notes_df[existing_cols].copy()
+                ext_df = ext_df.rename(
+                    columns={
+                        "PASS": "Note Parse PASS",
+                        "Compliance Errors": "Note Compliance Errors",
+                    }
+                )
+
                 ext_df = normalize_cols(ext_df)
-
-                # Keep rows where Client is present, but DO NOT filter out blank Session Time
                 ext_df = ext_df[ext_df["Client"].notna()]
-
 
                 st.session_state["external_sessions_df"] = ext_df
 
@@ -742,8 +713,10 @@ with tab1:
                     "These will be used automatically in the **Session Checker** tab."
                 )
 
-                # Download external sessions Excel
-                ext_xlsx = notes_to_excel_bytes(ext_df.to_dict(orient="records"), sheet_name="External Sessions")
+                ext_xlsx = notes_to_excel_bytes(
+                    ext_df.to_dict(orient="records"),
+                    sheet_name="External Sessions",
+                )
                 st.download_button(
                     "⬇️ Download External Session List (.xlsx)",
                     data=ext_xlsx,
@@ -753,15 +726,12 @@ with tab1:
         except Exception as e:
             st.error(f"Error during PDF processing: {e}")
 
+
 # =========================================================
 # TAB 2: SESSION CHECKER
 # =========================================================
-# Row-wise check helpers depend on sidebar settings and global flags
 def has_time_adjust_sig(row) -> bool:
-    """
-    True if the second parent signature column exists on this row and is non-empty.
-    This does NOT depend on the checkbox – it's just presence.
-    """
+    """True if time-adjustment parent approval signature exists and is non-empty."""
     if TIME_ADJ_COL not in row.index:
         return False
     val = row.get(TIME_ADJ_COL)
@@ -772,171 +742,97 @@ def has_time_adjust_sig(row) -> bool:
 
 
 def duration_ok_base(row) -> bool:
-    """Base duration check with over-max billing tolerance.
-
-    - Always fail if duration < MIN_MINUTES.
-    - Pass if MIN_MINUTES <= duration <= MAX_MINUTES.
-    - If duration > MAX_MINUTES, allow up to BILLING_TOL minutes over the max.
-      Only flag if it exceeds MAX_MINUTES + BILLING_TOL.
-    """
-    m = row["Actual Minutes"]
+    """Duration check with over-max tolerance; no tolerance below MIN."""
+    m = row.get("Actual Minutes")
     if pd.isna(m):
         return False
-
-    # Too short -> always fail (no tolerance below min)
     if m < MIN_MINUTES:
         return False
-
-    # Within base range -> OK
     if m <= MAX_MINUTES:
         return True
-
-    # Over max -> allow up to BILLING_TOL minutes over
-    over_by = m - MAX_MINUTES
-    if over_by <= BILLING_TOL:
-        return True
-
-    # More than BILLING_TOL minutes over -> fail
-    return False
+    return (m - MAX_MINUTES) <= BILLING_TOL
 
 
-def external_match_ok(row) -> bool:
+def external_time_ok(row) -> bool:
     """
-    External session requirement:
-    - If there is no 'Has External Session' column (no 2nd file), ignore this rule.
-    - If it exists, row only passes if Has External Session is True.
+    External session time must exist AND be parseable into start/end.
+    Notes are required; if not present, fail.
     """
     if "Has External Session" not in row.index:
-        return True
-    return bool(row["Has External Session"])
-
-def note_attendance_ok(row) -> bool:
-    """
-    Attendance rule:
-    - Client MUST be present
-    - BT/RBT MUST be present
-    - EITHER Parent/Caregiver OR Sibling must be present (both is fine)
-    """
-
-    client_present = row.get("_Note_ClientPresent")
-    bt_present = row.get("_Note_BTPresent")
-    parent_present = row.get("_Note_ParentPresent")
-    sibling_present = row.get("_Note_SiblingPresent")
-
-    # If we have no attendance info at all, don't fail the row
-    if all(pd.isna(x) for x in [client_present, bt_present, parent_present, sibling_present]):
-        return True
-
-    # Required
-    if not bool(client_present):
         return False
-
-    if not bool(bt_present):
+    if not bool(row.get("Has External Session")):
         return False
-
-    # Either Parent OR Sibling must be present
-    if not (bool(parent_present) or bool(sibling_present)):
-        return False
-
-    return True
-
+    return (not pd.isna(row.get("_ExtStart_dt"))) and (not pd.isna(row.get("_ExtEnd_dt")))
 
 
 def sig_ok_base(row) -> bool:
     """
-    Signature timing check against session end time.
-
-    Uses:
-    - _End_dt as the base timestamp (from internal PDF-derived times)
-    - _ParentSig_dt and _UserSig_dt for signatures
-    - SIG_TOL_EARLY / SIG_TOL_LATE from the sidebar
+    Signature timing check against session end time (_End_dt).
+    If both signatures are missing, treat as OK.
+    If signatures exist but no _End_dt, fail.
     """
     base_ts = row.get("_End_dt", pd.NaT)
-
     parent_sig_ts = row.get("_ParentSig_dt", pd.NaT)
     user_sig_ts = row.get("_UserSig_dt", pd.NaT)
 
-    # If both signatures are missing, treat as OK (no timing to check)
     if pd.isna(parent_sig_ts) and pd.isna(user_sig_ts):
         return True
 
     if pd.isna(base_ts):
-        # There ARE signatures but no internal end time to compare against
         return False
 
     checks = []
-
     if not pd.isna(parent_sig_ts):
-        checks.append(
-            within_time_tol(
-                parent_sig_ts,
-                base_ts,
-                SIG_TOL_EARLY,
-                SIG_TOL_LATE,
-            )
-        )
-
+        checks.append(within_time_tol(parent_sig_ts, base_ts, SIG_TOL_EARLY, SIG_TOL_LATE))
     if not pd.isna(user_sig_ts):
-        checks.append(
-            within_time_tol(
-                user_sig_ts,
-                base_ts,
-                SIG_TOL_EARLY,
-                SIG_TOL_LATE,
-            )
-        )
+        checks.append(within_time_tol(user_sig_ts, base_ts, SIG_TOL_EARLY, SIG_TOL_LATE))
 
-    # require all present signatures to be within tolerance
     return all(checks) if checks else False
 
 
 def daily_total_ok(row) -> bool:
-    """
-    Check if total minutes for this Staff on this Date exceed DAILY_MAX_MINUTES.
-    Uses precomputed 'Daily Minutes'.
-    """
+    """Daily total minutes per staff per day must be under cap + tolerance."""
     m = row.get("Daily Minutes")
     if pd.isna(m):
         return True
-    # BAD if >= threshold
     return m < (DAILY_MAX_MINUTES + DAILY_TOL)
 
 
-# Combined evaluation (uses checkbox + override)
+def note_parse_ok(row) -> bool:
+    """Notes must have everything; require note parse PASS."""
+    val = row.get("_NoteParseOk")
+    return bool(val) if not pd.isna(val) else False
+
+
 def evaluate_row(row) -> dict:
-    """
-    Returns dict of booleans:
-      - duration_ok
-      - sig_ok
-      - ext_ok
-      - daily_ok
-      - note_ok
-      - has_time_adj_sig
-      - overall_pass
-    """
     dur_base = duration_ok_base(row)
     sig_base = sig_ok_base(row)
-    ext_ok = external_match_ok(row)
+    ext_ok = external_time_ok(row)
     adj_sig = has_time_adjust_sig(row)
     daily_ok_val = daily_total_ok(row)
-    note_ok_val = note_attendance_ok(row)
+    note_parse_ok_val = note_parse_ok(row)
 
-    # Start from base
     duration_ok = dur_base
     sig_ok = sig_base
 
-    # If checkbox is ON and second parent signature exists, ignore signature issues
+    # If override is enabled and the time-adjustment signature exists, ignore signature timing failures
     if USE_TIME_ADJ_OVERRIDE and adj_sig:
         sig_ok = True
 
-    overall = duration_ok and sig_ok and ext_ok and daily_ok_val and note_ok_val
+    overall = (
+        duration_ok
+        and sig_ok
+        and daily_ok_val
+        and ext_ok
+        and note_parse_ok_val
+    )
 
     return {
         "duration_ok": duration_ok,
         "sig_ok": sig_ok,
         "ext_ok": ext_ok,
         "daily_ok": daily_ok_val,
-        "note_ok": note_ok_val,
+        "note_parse_ok": note_parse_ok_val,
         "has_time_adj_sig": adj_sig,
         "overall_pass": overall,
         "duration_ok_base": dur_base,
@@ -944,11 +840,30 @@ def evaluate_row(row) -> dict:
     }
 
 
-
-
 def get_failure_reasons(row) -> str:
     eval_res = evaluate_row(row)
     reasons = []
+
+    # Note parse failures FIRST (most important)
+    if not eval_res.get("note_parse_ok", True):
+        note_pass = row.get("Note Parse PASS", np.nan)
+        note_errs = row.get("Note Compliance Errors", np.nan)
+
+        if pd.isna(note_pass):
+            reasons.append("No matching session note found in PDF (required)")
+        else:
+            if pd.isna(note_errs) or str(note_errs).strip() == "":
+                reasons.append("Session note failed compliance checks")
+            else:
+                reasons.append(f"Session note failed compliance checks: {note_errs}")
+
+    # External time failures
+    if not eval_res["ext_ok"]:
+        stime = row.get("Session Time", "")
+        if pd.isna(stime) or str(stime).strip() == "":
+            reasons.append("Session Time missing/blank (cannot derive start/end)")
+        else:
+            reasons.append("Session Time present but could not be parsed into start/end")
 
     # Duration failures (never overridden)
     if not eval_res["duration_ok"]:
@@ -961,20 +876,15 @@ def get_failure_reasons(row) -> str:
                 f"({MIN_MINUTES}-{MAX_MINUTES} min, +{BILLING_TOL} min tolerance over max)"
             )
 
-    # Signature failures (after considering override)
+    # Signature failures (after override)
     if not eval_res["sig_ok"]:
         tol_str = f"{SIG_TOL_EARLY}/+{SIG_TOL_LATE}"
         if USE_TIME_ADJ_OVERRIDE and not eval_res["has_time_adj_sig"]:
             reasons.append(
-                f"Signature not within {tol_str} minutes of end time "
-                "(no time-adjustment signature override)"
+                f"Signature not within {tol_str} minutes of end time (no time-adjustment override)"
             )
         else:
             reasons.append(f"Signature not within {tol_str} minutes of end time")
-
-    # External session failures
-    if not eval_res["ext_ok"]:
-        reasons.append("Session time empty on note")
 
     # Daily total failures
     if not eval_res.get("daily_ok", True):
@@ -982,29 +892,8 @@ def get_failure_reasons(row) -> str:
         if not pd.isna(daily_min):
             reasons.append(
                 f"Total daily duration for this BT on {row.get('Date')} "
-                f"({daily_min:.0f} min) exceeds {DAILY_MAX_MINUTES} min "
-                f"+ {DAILY_TOL} min tolerance"
+                f"({daily_min:.0f} min) exceeds {DAILY_MAX_MINUTES} min + {DAILY_TOL} min tolerance"
             )
-        # Note attendance failures
-    if not eval_res.get("note_ok", True):
-        missing = []
-
-        if "_Note_ClientPresent" in row.index and not bool(row["_Note_ClientPresent"]):
-            missing.append("Client")
-
-        if "_Note_BTPresent" in row.index and not bool(row["_Note_BTPresent"]):
-            missing.append("BT/RBT")
-
-        parent_ok = bool(row.get("_Note_ParentPresent"))
-        sibling_ok = bool(row.get("_Note_SiblingPresent"))
-
-        if not (parent_ok or sibling_ok):
-            missing.append("Parent/Caregiver or Sibling")
-
-        reasons.append(
-            "Session note attendance issue: missing " + ", ".join(missing)
-        )
-
 
     return "; ".join(reasons) if reasons else "PASS"
 
@@ -1012,7 +901,6 @@ def get_failure_reasons(row) -> str:
 with tab2:
     st.header("Session Checker")
 
-    # ---------- Main UI ----------
     st.subheader("Upload HiRamsus Excel File")
     sessions_file = st.file_uploader(
         "Upload HiRamsus Excel File",
@@ -1024,29 +912,18 @@ with tab2:
         st.info("Upload the HiRamsus Excel file to continue.")
         st.stop()
 
+    # Notes are REQUIRED
     external_sessions_df = st.session_state.get("external_sessions_df", None)
+    if external_sessions_df is None or len(external_sessions_df) == 0:
+        st.error("Session Notes PDF is REQUIRED. Please upload and parse notes in Tab 1 first.")
+        st.stop()
 
-    if external_sessions_df is not None and len(external_sessions_df) > 0:
-        st.success(
-            f"Using {len(external_sessions_df)} external session rows from the **Tools** tab."
-        )
-    else:
-        st.warning(
-            "No external sessions found from the Tools tab yet. "
-            "You can upload an external session file manually."
-        )
-        manual_external_file = st.file_uploader(
-            "External Session List (Client, Session Time)",
-            type=["csv", "xlsx"],
-            key="external_sessions_manual_only",
-        )
-        if manual_external_file is not None:
-            external_sessions_df = read_any(manual_external_file)
+    st.success(f"Using {len(external_sessions_df)} external session rows from the **Tools** tab.")
 
     # Checkbox: use second parent signature as override for signature timing only
     global USE_TIME_ADJ_OVERRIDE
     USE_TIME_ADJ_OVERRIDE = st.toggle(
-        f"Use '{TIME_ADJ_COL}' as a signature override (only for sessions that failed signature timing; duration & daily limit still enforced)",
+        f"Use '{TIME_ADJ_COL}' as a signature override (signature timing only; duration & daily limit still enforced)",
         value=False,
     )
 
@@ -1054,14 +931,12 @@ with tab2:
     df = pd.read_excel(sessions_file, dtype=object)
     df = normalize_cols(df)
 
-    # Handle possible "Start Date" vs "Start date" header
     if "Start date" not in df.columns and "Start Date" in df.columns:
         df = df.rename(columns={"Start Date": "Start date"})
 
     if not ensure_cols(df, REQ_COLS, "Sessions File"):
         st.stop()
 
-    # If override is enabled, ensure the column exists (otherwise user probably mis-clicked)
     if USE_TIME_ADJ_OVERRIDE:
         if not ensure_cols(df, [TIME_ADJ_COL], "Sessions File"):
             st.stop()
@@ -1072,17 +947,15 @@ with tab2:
         & (df["Session"].astype(str).str.strip() == SESSION_REQUIRED)
     ].copy()
 
-   # ---------- Parse Duration (initially from HiRasmus Duration) ----------
+    # ---------- Parse Duration ----------
     df_f["Actual Minutes"] = df_f["Duration"].apply(parse_duration_to_minutes)
 
-    # ---------- Parse Date from Start date (keep only text before first space) ----------
+    # ---------- Parse Date from Start date ----------
     start_raw = df_f["Start date"].astype(str).str.strip()
-    # e.g. "11/30/2025  5:00:00 PM" -> "11/30/2025"
     start_clean = start_raw.str.split().str[0]
-
     df_f["Date"] = pd.to_datetime(start_clean, errors="coerce").dt.date
 
-    # Internal end time (for signature) will come from PDF-derived times only
+    # Signature timestamps
     df_f["_End_dt"] = pd.NaT
     df_f["_ParentSig_dt"] = pd.to_datetime(df_f["Parent signature time"], errors="coerce")
     df_f["_UserSig_dt"] = pd.to_datetime(df_f["User signature time"], errors="coerce")
@@ -1091,71 +964,66 @@ with tab2:
     df_f["Staff Name"] = df_f["User"].apply(normalize_name)
     df_f["Client Name"] = df_f["Client"].apply(normalize_name)
 
-    # ---------- Optional: Match to external Client/Session Time list ----------
-    if external_sessions_df is not None:
-        ext_df = external_sessions_df
-        ext_df = normalize_cols(ext_df)
-        if ensure_cols(ext_df, ["Client", "Session Time"], "External Sessions File"):
-            # Normalize client names in the external file the same way
-            ext_df["Client Name"] = ext_df["Client"].apply(normalize_name)
+    # ---------- Match to external Client/Session Time list ----------
+    ext_df = normalize_cols(external_sessions_df)
 
-            # For each client, assign an order index (0,1,2,...) in the external file
-            ext_df["SessionIndex"] = ext_df.groupby("Client Name").cumcount()
+    if not ensure_cols(ext_df, ["Client", "Session Time", "Note Parse PASS", "Note Compliance Errors"], "External Sessions (from Tab 1)"):
+        st.stop()
 
-            # In the HiRasmus dataframe, assign per-client order index
-            df_f["SessionIndex"] = df_f.groupby("Client Name").cumcount()
+    ext_df["Client Name"] = ext_df["Client"].apply(normalize_name)
+    ext_df["SessionIndex"] = ext_df.groupby("Client Name").cumcount()
 
-            merge_cols = ["Client Name", "SessionIndex", "Session Time",
-                      "Present_Client", "Present_ParentCaregiver", "Present_BT_RBT"]
-            merge_cols = [c for c in merge_cols if c in ext_df.columns]
+    df_f = df_f.sort_values(by=["Client Name", "Date", "Start date"], na_position="last").reset_index(drop=True)
+    df_f["SessionIndex"] = df_f.groupby("Client Name").cumcount()
 
-            df_f = df_f.merge(
-                ext_df[merge_cols],
-                on=["Client Name", "SessionIndex"],
-                how="left",
-                sort=False,
-            )
+    merge_cols = [
+        "Client Name",
+        "SessionIndex",
+        "Session Time",
+        "Present_Client",
+        "Present_Adult_Caregiver",
+        "Present_Sibling",
+        "Present_BT_RBT",
+        "Note Parse PASS",
+        "Note Compliance Errors",
+    ]
+    merge_cols = [c for c in merge_cols if c in ext_df.columns]
 
-            # Map Present_* from external notes into internal _Note_* flags
-            for src, dst in [
-                ("Present_Client", "_Note_ClientPresent"),
-                ("Present_ParentCaregiver", "_Note_ParentPresent"),
-                ("Present_Sibling", "_Note_SiblingPresent"),
-                ("Present_BT_RBT", "_Note_BTPresent"),
-            ]:
-                if src in df_f.columns:
-                    df_f[dst] = df_f[src].fillna(False).astype(bool)
-                else:
-                    df_f[dst] = np.nan
+    df_f = df_f.merge(
+        ext_df[merge_cols],
+        on=["Client Name", "SessionIndex"],
+        how="left",
+        sort=False,
+    )
 
-            # True if this HiRasmus row has a matching external session record
-            df_f["Has External Session"] = df_f["Session Time"].notna()
+    # Note parse gate: if no match or parse fail => False
+    df_f["_NoteParseOk"] = df_f["Note Parse PASS"].fillna(False).astype(bool)
 
-            # ---- Use Session Time to derive internal start/end + override duration ----
-            df_f[["_ExtStart_dt", "_ExtEnd_dt"]] = df_f.apply(
-                lambda r: pd.Series(
-                    parse_session_time_range(r.get("Session Time"), r.get("Date"))
-                ),
-                axis=1,
-            )
+    # Derive Has External Session from non-blank Session Time
+    df_f["Has External Session"] = (
+        df_f["Session Time"].notna()
+        & (df_f["Session Time"].astype(str).str.strip() != "")
+    )
 
-            has_ext_valid = (
-                df_f["Has External Session"]
-                & df_f["_ExtStart_dt"].notna()
-                & df_f["_ExtEnd_dt"].notna()
-            )
+    # Derive external start/end + set internal end
+    df_f[["_ExtStart_dt", "_ExtEnd_dt"]] = df_f.apply(
+        lambda r: pd.Series(parse_session_time_range(r.get("Session Time"), r.get("Date"))),
+        axis=1,
+    )
 
-            # Override Actual Minutes and _End_dt for rows with valid external times
-            df_f.loc[has_ext_valid, "Actual Minutes"] = (
-                (df_f.loc[has_ext_valid, "_ExtEnd_dt"] - df_f.loc[has_ext_valid, "_ExtStart_dt"])
-                .dt.total_seconds()
-                / 60.0
-            )
-            df_f.loc[has_ext_valid, "_End_dt"] = df_f.loc[has_ext_valid, "_ExtEnd_dt"]
-        else:
-            st.warning(
-                "External sessions data provided, but required columns are missing."
-            )
+    has_ext_valid = (
+        df_f["Has External Session"]
+        & df_f["_ExtStart_dt"].notna()
+        & df_f["_ExtEnd_dt"].notna()
+    )
+
+    # Override Actual Minutes and _End_dt for rows with valid external times
+    df_f.loc[has_ext_valid, "Actual Minutes"] = (
+        (df_f.loc[has_ext_valid, "_ExtEnd_dt"] - df_f.loc[has_ext_valid, "_ExtStart_dt"])
+        .dt.total_seconds()
+        / 60.0
+    )
+    df_f.loc[has_ext_valid, "_End_dt"] = df_f.loc[has_ext_valid, "_ExtEnd_dt"]
 
     # ---------- Attach BT contacts via fuzzy match ----------
     df_f["Phone"] = ""
@@ -1171,7 +1039,6 @@ with tab2:
             if bt_missing:
                 st.error(f"BT Contacts file is missing: {sorted(bt_missing)}")
             else:
-                # Normalize BT Name in same way as Staff Name
                 bt_df["BT_formatted"] = bt_df["BT Name"].apply(normalize_name)
 
                 def norm_name(s: str) -> str:
@@ -1207,46 +1074,29 @@ with tab2:
                 df_f["Email"] = df_f["Staff Name"].map(staff_to_email)
 
     # ---------- Daily total minutes per Staff per Date ----------
-    df_f["Daily Minutes"] = (
-        df_f.groupby(["Staff Name", "Date"])["Actual Minutes"].transform("sum")
-    )
+    df_f["Daily Minutes"] = df_f.groupby(["Staff Name", "Date"])["Actual Minutes"].transform("sum")
 
     # ---------- Run Checks ----------
     eval_results = df_f.apply(evaluate_row, axis=1, result_type="expand")
 
-    if isinstance(eval_results, pd.DataFrame):
-        df_f["_DurationOk"] = eval_results["duration_ok"]
-        df_f["_SigOk"] = eval_results["sig_ok"]
-        df_f["_ExtOk"] = eval_results["ext_ok"]
-        df_f["_DailyOk"] = eval_results["daily_ok"]
-        df_f["_HasTimeAdjSig"] = eval_results["has_time_adj_sig"]
-        df_f["_NoteOk"] = eval_results["note_ok"]
-        df_f["_OverallPass"] = eval_results["overall_pass"]
-
-    else:
-        df_f["_DurationOk"] = eval_results.apply(lambda r: r["duration_ok"])
-        df_f["_SigOk"] = eval_results.apply(lambda r: r["sig_ok"])
-        df_f["_ExtOk"] = eval_results.apply(lambda r: r["ext_ok"])
-        df_f["_DailyOk"] = eval_results.apply(lambda r: r["daily_ok"])
-        df_f["_HasTimeAdjSig"] = eval_results.apply(lambda r: r["has_time_adj_sig"])
-        df_f["_NoteOk"] = eval_results.apply(lambda r: r["note_ok"])
-        df_f["_OverallPass"] = eval_results.apply(lambda r: r["overall_pass"])
-        
+    df_f["_DurationOk"] = eval_results["duration_ok"]
+    df_f["_SigOk"] = eval_results["sig_ok"]
+    df_f["_ExtOk"] = eval_results["ext_ok"]
+    df_f["_DailyOk"] = eval_results["daily_ok"]
+    df_f["_HasTimeAdjSig"] = eval_results["has_time_adj_sig"]
+    df_f["_NoteParseOk"] = eval_results["note_parse_ok"]
+    df_f["_OverallPass"] = eval_results["overall_pass"]
 
     df_f["Failure Reasons"] = df_f.apply(get_failure_reasons, axis=1)
 
-    # ---------- Pretty-print signature columns (show date + time) ----------
-    for col in [
-        "Parent signature time",
-        "User signature time",
-    ]:
+    # ---------- Pretty-print signature columns ----------
+    for col in ["Parent signature time", "User signature time"]:
         if col in df_f.columns:
             df_f[col] = (
                 pd.to_datetime(df_f[col], errors="coerce")
-                .dt.strftime("%m/%d/%Y %I:%M:%S %p")  # e.g. 11/29/2025 10:38:28 PM
+                .dt.strftime("%m/%d/%Y %I:%M:%S %p")
                 .fillna("")
             )
-
 
     # ---------- Display ----------
     display_cols = [
@@ -1262,9 +1112,10 @@ with tab2:
         "Parent signature time",
         "User signature time",
         "Session Time",
+        "Note Parse PASS",
+        "Note Compliance Errors",
     ]
 
-    # Show the time-adjustment approval column if present
     if TIME_ADJ_COL in df_f.columns:
         display_cols.append(TIME_ADJ_COL)
 
@@ -1275,7 +1126,7 @@ with tab2:
             "_ExtOk",
             "_DailyOk",
             "_HasTimeAdjSig",
-            "_NoteOk",
+            "_NoteParseOk",
             "Failure Reasons",
         ]
     )
@@ -1302,7 +1153,6 @@ with tab2:
     else:
         export_df = df_f.copy()
 
-    # Store final Session Checker dataframe for use in Tab 3 (Billed Checker)
     st.session_state["session_checker_df"] = export_df.copy()
     st.session_state["session_checker_present_cols"] = present_cols
 
@@ -1312,17 +1162,12 @@ with tab2:
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.download_button(
-            "⬇️ Download All", data=xlsx_all, file_name="all_sessions.xlsx"
-        )
+        st.download_button("⬇️ Download All", data=xlsx_all, file_name="all_sessions.xlsx")
     with c2:
-        st.download_button(
-            "✅ Passed Only", data=xlsx_clean, file_name="clean_sessions.xlsx"
-        )
+        st.download_button("✅ Passed Only", data=xlsx_clean, file_name="clean_sessions.xlsx")
     with c3:
-        st.download_button(
-            "⚠️ Failed Only", data=xlsx_flagged, file_name="flagged_sessions.xlsx"
-        )
+        st.download_button("⚠️ Failed Only", data=xlsx_flagged, file_name="flagged_sessions.xlsx")
+
 
 # =========================================================
 # TAB 3: BILLED CHECKER – BILLED / UNBILLED / NO MATCH
@@ -1334,16 +1179,12 @@ with tab3:
     present_cols = st.session_state.get("session_checker_present_cols")
 
     if base_df is None or present_cols is None:
-        st.info(
-            "Please run the **Session Checker** in Tab 2 first. "
-            "Once you have results there, come back here."
-        )
+        st.info("Please run the **Session Checker** in Tab 2 first.")
     else:
         st.subheader("Upload Aloha Billing Status File")
 
         billing_file = st.file_uploader(
-            "Upload Aloha file with billed & unbilled sessions "
-            "(must include 'Appointment ID' and 'Date Billed')",
+            "Upload Aloha file with billed & unbilled sessions (must include 'Appointment ID' and 'Date Billed')",
             type=["xlsx", "xls", "csv"],
             key="billing_status_file",
         )
@@ -1358,18 +1199,11 @@ with tab3:
             if billing_df is not None:
                 billing_df = normalize_cols(billing_df)
 
-                # Check required columns
                 if "Appointment ID" not in billing_df.columns or "Date Billed" not in billing_df.columns:
-                    st.error(
-                        "Billing status file must contain columns: 'Appointment ID' and 'Date Billed'."
-                    )
+                    st.error("Billing status file must contain columns: 'Appointment ID' and 'Date Billed'.")
                 elif "AlohaABA Appointment ID" not in base_df.columns:
-                    st.error(
-                        "Session Checker data is missing 'AlohaABA Appointment ID'. "
-                        "Please ensure the HiRasmus export includes this column."
-                    )
+                    st.error("Session Checker data is missing 'AlohaABA Appointment ID'.")
                 else:
-                    # Merge Session Checker data with billing status on Appointment ID
                     merged = base_df.merge(
                         billing_df[["Appointment ID", "Date Billed"]],
                         left_on="AlohaABA Appointment ID",
@@ -1377,11 +1211,10 @@ with tab3:
                         how="left",
                         sort=False,
                     )
-                    # ---------- Clean up name columns for Tab 3 ----------
+
                     cols_to_drop = [c for c in ["Client", "User"] if c in merged.columns]
                     merged = merged.drop(columns=cols_to_drop)
 
-                    # ---------- Reorder columns for Tab 3 ----------
                     desired_order = [
                         "Status",
                         "Date/Time",
@@ -1401,11 +1234,8 @@ with tab3:
                         "Client Name",
                         "SessionIndex",
                         "Session Time",
-                        "Present_Client",
-                        "Present_BT_RBT",
-                        "_Note_ClientPresent",
-                        "_Note_ParentPresent",
-                        "_Note_BTPresent",
+                        "Note Parse PASS",
+                        "Note Compliance Errors",
                         "Has External Session",
                         "_ExtStart_dt",
                         "_ExtEnd_dt",
@@ -1417,7 +1247,7 @@ with tab3:
                         "_ExtOk",
                         "_DailyOk",
                         "_HasTimeAdjSig",
-                        "_NoteOk",
+                        "_NoteParseOk",
                         "_OverallPass",
                         "Failure Reasons",
                         "Appointment ID",
@@ -1425,124 +1255,77 @@ with tab3:
                         "Billing Status",
                     ]
 
-                    # Keep only columns that actually exist, in the desired order
                     ordered_cols = [c for c in desired_order if c in merged.columns]
                     merged = merged[ordered_cols]
 
-
-                    # Classify billing status per row
                     def classify_status(row):
                         app_id = str(row.get("Appointment ID", "")).strip()
                         date_billed = str(row.get("Date Billed", "")).strip()
 
-                        # No match at all in billing file
                         if app_id == "" or app_id.lower() == "nan":
                             return "No Match"
-
-                        # Matched, now check if billed vs unbilled
                         if date_billed != "" and date_billed.lower() != "nan":
                             return "Billed"
                         return "Unbilled"
 
                     merged["Billing Status"] = merged.apply(classify_status, axis=1)
 
-                    # Split into categories
-                    all_df = all_df = merged.copy()
                     billed_df = merged[merged["Billing Status"] == "Billed"]
                     unbilled_df = merged[merged["Billing Status"] == "Unbilled"]
                     nomatch_df = merged[merged["Billing Status"] == "No Match"]
 
-                    # Split unbilled into clean vs flagged based on _OverallPass
                     unbilled_clean_df = unbilled_df[unbilled_df["_OverallPass"] == True]
                     unbilled_flagged_df = unbilled_df[unbilled_df["_OverallPass"] == False]
 
-                    # Counts
                     total_sessions = len(merged)
                     billed_count = len(billed_df)
                     unbilled_clean_count = len(unbilled_clean_df)
                     unbilled_flagged_count = len(unbilled_flagged_df)
                     nomatch_count = len(nomatch_df)
 
-                    # Summary
                     st.markdown(
                         f"""
 **Total sessions (from Session Checker):** {total_sessions}  
 - **Billed:** {billed_count}  
 - **Unbilled – Clean:** {unbilled_clean_count}  
 - **Unbilled – Flagged:** {unbilled_flagged_count}  
-- **No Match (no Appointment ID match):** {nomatch_count}
+- **No Match:** {nomatch_count}
 """
                     )
 
                     summary_df = pd.DataFrame(
                         {
-                            "Status": [
-                                "Billed",
-                                "Unbilled – Clean",
-                                "Unbilled – Flagged",
-                                "No Match",
-                            ],
-                            "Count": [
-                                billed_count,
-                                unbilled_clean_count,
-                                unbilled_flagged_count,
-                                nomatch_count,
-                            ],
+                            "Status": ["Billed", "Unbilled – Clean", "Unbilled – Flagged", "No Match"],
+                            "Count": [billed_count, unbilled_clean_count, unbilled_flagged_count, nomatch_count],
                         }
                     )
                     st.table(summary_df)
 
-                    # ---------- Downloads by Billing Status ----------
                     dl_cols = [
                         c
-                        for c in dict.fromkeys(
-                            present_cols
-                            + ["Appointment ID", "Date Billed", "Billing Status"]
-                        ).keys()
+                        for c in dict.fromkeys(present_cols + ["Appointment ID", "Date Billed", "Billing Status"]).keys()
                         if c in merged.columns
                     ]
 
-                    all_dl = all_df[dl_cols]
                     billed_dl = billed_df[dl_cols]
                     unbilled_clean_dl = unbilled_clean_df[dl_cols]
                     unbilled_flagged_dl = unbilled_flagged_df[dl_cols]
                     nomatch_dl = nomatch_df[dl_cols]
 
-                    xlsx_all = export_excel(all_df)
                     xlsx_billed = export_excel(billed_dl)
                     xlsx_unbilled_clean = export_excel(unbilled_clean_dl)
                     xlsx_unbilled_flagged = export_excel(unbilled_flagged_dl)
                     xlsx_nomatch = export_excel(nomatch_dl)
+                    xlsx_all = export_excel(merged[dl_cols])
 
-                    c1, c2, c3, c4 , c5= st.columns(5)
+                    c1, c2, c3, c4, c5 = st.columns(5)
                     with c1:
-                        st.download_button(
-                            "⬇️ Billed Sessions",
-                            data=xlsx_billed,
-                            file_name="billed_sessions.xlsx",
-                        )
+                        st.download_button("⬇️ Billed Sessions", data=xlsx_billed, file_name="billed_sessions.xlsx")
                     with c2:
-                        st.download_button(
-                            "⬇️ Unbilled – Clean",
-                            data=xlsx_unbilled_clean,
-                            file_name="unbilled_clean_sessions.xlsx",
-                        )
+                        st.download_button("⬇️ Unbilled – Clean", data=xlsx_unbilled_clean, file_name="unbilled_clean_sessions.xlsx")
                     with c3:
-                        st.download_button(
-                            "⬇️ Unbilled – Flagged",
-                            data=xlsx_unbilled_flagged,
-                            file_name="unbilled_flagged_sessions.xlsx",
-                        )
+                        st.download_button("⬇️ Unbilled – Flagged", data=xlsx_unbilled_flagged, file_name="unbilled_flagged_sessions.xlsx")
                     with c4:
-                        st.download_button(
-                            "⬇️ No Match Sessions",
-                            data=xlsx_nomatch,
-                            file_name="no_match_sessions.xlsx",
-                        )
+                        st.download_button("⬇️ No Match Sessions", data=xlsx_nomatch, file_name="no_match_sessions.xlsx")
                     with c5:
-                        st.download_button(
-                            "⬇️ All Sessions",
-                            data=xlsx_all,
-                            file_name="all_sessions.xlsx",
-                        )
-
+                        st.download_button("⬇️ All Sessions", data=xlsx_all, file_name="all_sessions.xlsx")
