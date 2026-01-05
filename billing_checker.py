@@ -1,12 +1,19 @@
 import io
 import re
+import unicodedata
 from typing import Any
 from difflib import SequenceMatcher
+
+from utils import (
+    normalize_session_time,
+    parse_session_time_range,
+)
 
 import fitz
 import numpy as np
 import pandas as pd
 import streamlit as st
+
 
 # -----------------------------
 # PAGE CONFIG
@@ -16,6 +23,7 @@ st.set_page_config(
     layout="wide",
 )
 st.title("HiRasmus Billing Session Checker")
+
 
 # -----------------------------
 # GLOBAL CONFIG
@@ -45,6 +53,124 @@ REQ_COLS = [
 ]
 
 DATE_RE = r"(\d{1,4}/\d{1,2}/\d{1,4})"
+
+
+# =========================================================
+# Excel-safe sanitizer (prevents: "cannot be used in worksheets")
+# =========================================================
+_ILLEGAL_XL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+def excel_safe_str(v: Any) -> Any:
+    """Remove illegal control chars that break Excel writers. Keep unicode (Chinese ok)."""
+    if v is None:
+        return v
+    if isinstance(v, float) and pd.isna(v):
+        return v
+    s = str(v)
+    s = _ILLEGAL_XL_CHARS_RE.sub("", s)
+    return s
+
+def excel_sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
+    df2 = df.copy()
+    for c in df2.columns:
+        if df2[c].dtype == object:
+            df2[c] = df2[c].map(excel_safe_str)
+    return df2
+import unicodedata
+import re
+
+def strip_private_use(s: str) -> str:
+    """Remove private-use unicode chars (where the '􀀀' junk usually lives)."""
+    if s is None:
+        return ""
+    s = str(s)
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Co")
+
+def clean_time_text(s: str) -> str:
+    """Normalize PDF-extracted time text into something parseable."""
+    if not s:
+        return ""
+    s = strip_private_use(s)
+
+    # normalize unicode width and punctuation
+    s = unicodedata.normalize("NFKC", s)
+
+    # unify dash variants
+    s = s.replace("–", "-").replace("—", "-").replace("−", "-")
+
+    # normalize AM/PM variants: "p.m." "P.M." "pm" etc
+    s_low = s.lower()
+    s_low = s_low.replace("a.m.", "am").replace("p.m.", "pm")
+    s_low = s_low.replace("a. m.", "am").replace("p. m.", "pm")
+    s = s_low
+
+    # clean spacing around hyphen
+    s = re.sub(r"\s*-\s*", " - ", s)
+
+    # collapse whitespace
+    s = " ".join(s.split()).strip()
+    return s
+
+_TIME_RANGE_RE = re.compile(
+    r"(?P<s_h>\d{1,2})\s*:\s*(?P<s_m>\d{2})\s*(?P<s_ampm>am|pm)?"
+    r"\s*-\s*"
+    r"(?P<e_h>\d{1,2})\s*:\s*(?P<e_m>\d{2})\s*(?P<e_ampm>am|pm)?",
+    re.I
+)
+
+def extract_first_time_range(raw: str) -> str:
+    """
+    Returns a normalized time range string like:
+      '12:30 PM - 04:30 PM' or '05:00 PM - 09:30 PM'
+    If AM/PM is missing, we infer with a conservative heuristic.
+    """
+    raw = clean_time_text(raw)
+    if not raw:
+        return ""
+
+    m = _TIME_RANGE_RE.search(raw)
+    if not m:
+        return ""
+
+    sh = int(m.group("s_h"))
+    sm = int(m.group("s_m"))
+    eh = int(m.group("e_h"))
+    em = int(m.group("e_m"))
+    s_ampm = (m.group("s_ampm") or "").lower()
+    e_ampm = (m.group("e_ampm") or "").lower()
+
+    def fmt(h, minute, ampm):
+        return f"{h:02d}:{minute:02d} {ampm.upper()}"
+
+    # If only one side has am/pm, apply it to both
+    if s_ampm and not e_ampm:
+        e_ampm = s_ampm
+    if e_ampm and not s_ampm:
+        s_ampm = e_ampm
+
+    # If neither has am/pm, infer (common in HiRasmus PDFs)
+    if not s_ampm and not e_ampm:
+        # Heuristic:
+        # - If start hour >= 4 => assume PM (after-school/evening sessions)
+        # - If start hour == 12 => assume PM (noon)
+        # - Else assume AM
+        if sh == 12 or sh >= 4:
+            s_ampm = e_ampm = "pm"
+        else:
+            s_ampm = e_ampm = "am"
+
+    # Convert to 12h display for consistency
+    def to_12h(hour, ampm):
+        hour = hour % 12
+        if hour == 0:
+            hour = 12
+        return hour, ampm
+
+    sh12, s_ampm = to_12h(sh, s_ampm)
+    eh12, e_ampm = to_12h(eh, e_ampm)
+
+    return f"{fmt(sh12, sm, s_ampm)} - {fmt(eh12, em, e_ampm)}"
+
 # -----------------------------
 # PDF → TEXT (TOOLS TAB)
 # -----------------------------
@@ -71,56 +197,6 @@ def pdf_bytes_to_text(pdf_bytes: bytes, preserve_layout: bool = True) -> str:
 
     doc.close()
     return "".join(all_text)
-
-
-def normalize_session_time(raw: str) -> str:
-    raw = re.sub(r"\b(a\.m\.|am)\b", "AM", raw, flags=re.I)
-    raw = re.sub(r"\b(p\.m\.|pm)\b", "PM", raw, flags=re.I)
-
-    if not raw:
-        return ""
-
-    raw = raw.strip()
-
-    # Chinese Normalization
-    if "上午" in raw or "下午" in raw:
-        raw = raw.replace("上午", "AM ")
-        raw = raw.replace("下午", "PM ")
-        raw = re.sub(r"[–—]", "-", raw)
-        raw = re.sub(r"\s+", " ", raw).strip()
-
-    # Already 12h with AM/PM
-    if re.search(r"\b(AM|PM)\b", raw, re.IGNORECASE):
-        parts = re.split(r"\s*-\s*", raw)
-        if len(parts) == 2:
-            return f"{parts[0].strip()} - {parts[1].strip()}"
-        return raw
-
-    # 24h range → convert
-    m = re.match(
-        r"^\s*([0-9]{1,2}):([0-9]{2})\s*-\s*([0-9]{1,2}):([0-9]{2})\s*$",
-        raw,
-    )
-    if not m:
-        return raw
-
-    h1, m1, h2, m2 = map(int, m.groups())
-
-    def to_12h(h, minute):
-        ampm = "AM"
-        if h == 0:
-            h12 = 12
-        elif h < 12:
-            h12 = h
-        elif h == 12:
-            h12 = 12
-            ampm = "PM"
-        else:
-            h12 = h - 12
-            ampm = "PM"
-        return f"{h12}:{minute:02d} {ampm}"
-
-    return f"{to_12h(h1, m1)} - {to_12h(h2, m2)}"
 
 
 def normalize_date(raw: str) -> str:
@@ -151,6 +227,85 @@ def normalize_date(raw: str) -> str:
     return f"{year:04d}/{month:02d}/{day:02d}"
 
 
+# =========================================================
+# Provider signature parsing + validation
+# =========================================================
+def _clean_pdf_line(s: str) -> str:
+    if s is None:
+        return ""
+    # normalize full-width punctuation, etc.
+    s = unicodedata.normalize("NFKC", str(s))
+    # common weird placeholders
+    s = s.replace("\u00a0", " ").replace("􀀀", " ")
+    # keep printable (Chinese is printable), remove other junk
+    s = "".join(ch for ch in s if ch.isprintable())
+    # collapse whitespace
+    s = " ".join(s.split())
+    return s.strip()
+
+def extract_provider_signature_candidates(block_text: str) -> list[str]:
+    """
+    Finds each 'Provider Signatures/Credentials and Date' label and captures
+    signature content either on the SAME line after the label or on the NEXT line.
+    Supports multiple occurrences within one note.
+    """
+    label_re = re.compile(
+        r"Provider\s+Signatures?\s*(?:/\s*)?Credentials\s+and\s+Date\s*:?\s*",
+        re.I,
+    )
+
+    cands: list[str] = []
+    for m in label_re.finditer(block_text):
+        tail = block_text[m.end() : m.end() + 800]
+        if not tail:
+            continue
+
+        lines = tail.splitlines()
+        first_line = _clean_pdf_line(lines[0]) if len(lines) >= 1 else ""
+
+        rest_lines = [_clean_pdf_line(x) for x in lines[1:10]]
+        rest_lines = [x for x in rest_lines if x]
+
+        pieces = []
+        if first_line:
+            pieces.append(first_line)
+        if rest_lines:
+            pieces.append(rest_lines[0])
+
+        cand = _clean_pdf_line(" ".join(pieces))
+        if cand:
+            cands.append(cand)
+
+    return cands
+
+def any_signature_line_valid(block_text: str) -> tuple[bool, list[str]]:
+    """
+    Valid if ANY candidate contains:
+      - BT or RBT anywhere (case-insensitive, even glued like 'sunbt')
+      - a date like 1/2/2026 OR 2026/1/2 (allow / or - and optional spaces)
+      - at least some alphabetic characters (name)
+    Returns (is_valid, candidates)
+    """
+    cands = extract_provider_signature_candidates(block_text)
+
+    for cand in cands:
+        # must contain BT or RBT somewhere
+        if not re.search(r"R?BT", cand, re.I):
+            continue
+
+        # must contain a date (MM/DD/YYYY or YYYY/MM/DD; allow / or -; allow spaces)
+        if not re.search(r"\b\d{1,4}\s*[/-]\s*\d{1,2}\s*[/-]\s*\d{1,4}\b", cand):
+            continue
+
+        # must contain letters (name)
+        if not any(ch.isalpha() for ch in cand):
+            continue
+
+        return True, cands
+
+    return False, cands
+
+
 def parse_notes(text: str):
     """
     Parse ABA session notes from extracted PDF text and enforce compliance.
@@ -167,8 +322,6 @@ def parse_notes(text: str):
         # =====================
         # BASIC IDENTIFIERS
         # =====================
-
-        # IMPORTANT FIX: do NOT stop at comma; many PDFs show "Last, First"
         client_match = re.search(r"Client\s*:\s*([^\n]+)", block)
         client_name = client_match.group(1).strip() if client_match else ""
         if not client_name:
@@ -180,22 +333,19 @@ def parse_notes(text: str):
         # =====================
         # REQUIRED DEMOGRAPHICS
         # =====================
-
         dob_match = re.search(rf"Date of Birth\s*:\s*{DATE_RE}", block, re.I)
         dob = normalize_date(dob_match.group(1)) if dob_match else ""
-
 
         gender_match = re.search(r"Gender\s*:\s*([^\n\r]+)", block, re.I)
         gender_raw = gender_match.group(1).strip() if gender_match else ""
 
-        # Normalize gender values
         g = gender_raw.strip().lower()
         if g in ("male", "m", "man", "boy", "男性", "男"):
             gender = "Male"
         elif g in ("female", "f", "woman", "girl", "女性", "女"):
             gender = "Female"
         else:
-            gender = gender_raw  # keep whatever is provided
+            gender = gender_raw
 
         # Diagnosis Code (ICD / IDC tolerant)
         diagnosis = ""
@@ -219,39 +369,52 @@ def parse_notes(text: str):
         # =====================
         # SESSION DATE & TIME
         # =====================
-
         date_match = re.search(rf"Session Date\s*:\s*{DATE_RE}", block, re.I)
         session_date = normalize_date(date_match.group(1)) if date_match else ""
-
 
         session_time_match = re.search(
             r"Session Time\s*:\s*([0-9]{1,2}:[0-9]{2}\s*(?:AM|PM)?\s*-\s*[0-9]{1,2}:[0-9]{2}\s*(?:AM|PM)?)",
             block,
             re.I,
         )
-        raw_session_time = session_time_match.group(1) if session_time_match else ""
+        raw_session_time = ""
 
-        if not raw_session_time:
-            cn_match = re.search(
-                r"(上午|下午)\s*[0-9]{1,2}:[0-9]{2}\s*-\s*(上午|下午)\s*[0-9]{1,2}:[0-9]{2}",
-                block,
-            )
-            if cn_match:
-                raw_session_time = cn_match.group(0)
+        m = re.search(r"Session Time\s*:\s*(.*)", block, re.I)
+        if m:
+            start_idx = m.start()
+            tail = block[start_idx : start_idx + 250]
+            tail_lines = tail.splitlines()
 
-        session_time = normalize_session_time(raw_session_time) if raw_session_time else ""
+            idx = 0
+            for i, ln in enumerate(tail_lines[:6]):
+                if re.search(r"Session Time\s*:", ln, re.I):
+                    idx = i
+                    break
+
+            line0 = tail_lines[idx]
+            after_colon = line0.split(":", 1)[1] if ":" in line0 else ""
+            gather = [after_colon]
+            gather.extend(tail_lines[idx + 1 : idx + 4])
+
+            raw_session_time = " ".join(gather)
+
+        session_time = extract_first_time_range(raw_session_time)
+
+            # If you want: keep raw if you can't normalize
+        if not session_time:
+            session_time = clean_time_text(raw_session_time).strip()
+
+
 
         # =====================
         # SESSION LOCATION
         # =====================
-
         location_match = re.search(r"Session Location\s*:\s*([^\n]+)", block)
         session_location = location_match.group(1).strip() if location_match else ""
 
         # =====================
         # PRESENT AT SESSION
         # =====================
-
         present_text = ""
         pos = block.lower().find("present at session")
         if pos != -1:
@@ -265,7 +428,6 @@ def parse_notes(text: str):
         # =====================
         # MALADAPTIVE STATUS
         # =====================
-
         maladaptive_section = ""
         section_match = re.search(
             r"Maladaptive Status\s*:\s*(.*?)(?:\n[A-Z][a-zA-Z ]+?:|\Z)",
@@ -294,6 +456,7 @@ def parse_notes(text: str):
 
                 clean = re.sub(r"[•▪◦\-–—\uf0b7\uf0a7]+", "", clean).strip()
 
+                # keep short bullet-style items (typical maladaptive list)
                 if len(clean.split()) > 6 and not clean.lower().startswith("other"):
                     continue
 
@@ -307,31 +470,22 @@ def parse_notes(text: str):
         # =====================
         # SESSION DATA CHECK
         # =====================
-
         data_rows = re.findall(
-            r"\n\s*([a-zA-Z][a-zA-Z\s]+?)\s+([0-9]+)\s+([0-9]+)",
-            block,
+            r"\n\s*([A-Za-z][A-Za-z0-9\s,.\-’'()/]+?)\s+([0-9]{1,3})\s+([0-9]{1,3})\s*%?\s*(?=\n|$)",
+            block
         )
         data_collected = len(data_rows) > 0
+
+        summary_match = re.search(
+            r"(Session Summary|Summary of Session)\s*:\s*(.+?)(?:\n[A-Z][a-zA-Z ]+?:|\Z)",
+            block,
+            re.I | re.S,
+        )
+        session_summary_present = bool(summary_match and summary_match.group(2).strip())
 
         # =====================
         # ATTESTATION & SIGNATURE
         # =====================
-
-        provider_signature_present = bool(
-            re.search(r"Provider\s+Signatures/Credentials\s+and\s+Date\s*:", block, re.I)
-        )
-
-        provider_signature_valid = bool(
-            re.search(
-                r"Provider\s+Signatures/Credentials\s+and\s+Date\s*:\s*"
-                r"[A-Za-z][A-Za-z\s\-']+,\s*(?:BT|RBT)\s*,\s*"
-                r"[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}",
-                block,
-                re.I,
-            )
-        )
-
         bt_attestation_present = bool(
             re.search(
                 r"\battest\s+that\s+the\s+session\s+summary\s+is\s+accurate\s+and\s+correct\b",
@@ -350,10 +504,14 @@ def parse_notes(text: str):
 
         outcome_yes = bool(re.search(r"Outcome of Treatment.*?:\s*Yes", block, re.I | re.S))
 
+        # ✅ Provider signature validation
+        sig_valid, sig_cands = any_signature_line_valid(block)
+        provider_signature_present = len(sig_cands) > 0
+        provider_signature_valid = sig_valid
+
         # =====================
         # COMPLIANCE VALIDATION
         # =====================
-
         compliance_errors = []
 
         if not dob:
@@ -381,7 +539,8 @@ def parse_notes(text: str):
 
         if not data_collected:
             compliance_errors.append("No measurable session data found")
-
+        if not session_summary_present:
+            compliance_errors.append("Missing session summary narrative")
         if not outcome_yes:
             compliance_errors.append("Outcome of Treatment not Yes")
 
@@ -393,7 +552,7 @@ def parse_notes(text: str):
         elif not provider_signature_valid:
             compliance_errors.append("Provider signature present but invalid format (must include Name, BT/RBT, and date)")
 
-        # Attendance requirements (now enforced here)
+        # Attendance requirements
         if not present_client:
             compliance_errors.append("Attendance: Client not present")
         if not present_bt:
@@ -422,9 +581,11 @@ def parse_notes(text: str):
                 "Other Maladaptive Provided": other_maladaptive_present,
                 "Outcome Yes": outcome_yes,
                 "Data Collected": data_collected,
+                "Session Summary Present": session_summary_present,
                 "BT Attestation Present": bt_attestation_present,
                 "Provider Signature Present": provider_signature_present,
                 "Provider Signature Valid": provider_signature_valid,
+                "Provider Signature Candidates": sig_cands,  # debug
                 "Revision Attestation Present": revision_attestation_present,
                 "Compliance Errors": compliance_errors,
                 "PASS": len(compliance_errors) == 0,
@@ -435,8 +596,10 @@ def parse_notes(text: str):
 
 
 def notes_to_excel_bytes(results, sheet_name="Notes") -> bytes:
-    """Convert list[dict] → Excel bytes."""
+    """Convert list[dict] → Excel bytes (Excel-safe)."""
     df = pd.DataFrame(results)
+    df = excel_sanitize_df(df)
+
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
@@ -499,10 +662,12 @@ def parse_duration_to_minutes(d: Any) -> float:
 
 
 def export_excel(df: pd.DataFrame) -> bytes:
-    """Export a single sheet named 'All'."""
+    """Export a single sheet named 'All' (Excel-safe)."""
+    df2 = excel_sanitize_df(df)
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-        df.to_excel(w, index=False, sheet_name="All")
+        df2.to_excel(w, index=False, sheet_name="All")
     return buf.getvalue()
 
 
@@ -510,12 +675,15 @@ def within_time_tol(
     sig_ts: pd.Timestamp,
     base_ts: pd.Timestamp,
     tol_early_min: float,
-    tol_late_min: float,
+    tol_late_min: float = None,  # ignored
 ) -> bool:
     if pd.isna(sig_ts) or pd.isna(base_ts):
         return False
+
     diff_min = (sig_ts - base_ts).total_seconds() / 60.0
-    return (diff_min >= tol_early_min) and (diff_min <= tol_late_min)
+
+    # ONLY enforce early bound
+    return diff_min >= tol_early_min
 
 
 def normalize_name(name: Any) -> str:
@@ -550,30 +718,6 @@ def normalize_name(name: Any) -> str:
     return f"{last}, {first_middle}"
 
 
-def parse_session_time_range(session_time: Any, base_date: Any):
-    """
-    Parse '3:00 PM - 9:00 PM' into (start_dt, end_dt), using base_date.
-    """
-    if pd.isna(session_time):
-        return pd.NaT, pd.NaT
-
-    text = str(session_time).replace("\xa0", " ").strip()
-    if not text or "-" not in text:
-        return pd.NaT, pd.NaT
-
-    start_str, end_str = [part.strip() for part in text.split("-", 1)]
-
-    if pd.isna(base_date):
-        date_str = "1900-01-01"
-    else:
-        date_str = str(base_date)
-
-    start_dt = pd.to_datetime(f"{date_str} {start_str}", errors="coerce")
-    end_dt = pd.to_datetime(f"{date_str} {end_str}", errors="coerce")
-
-    return start_dt, end_dt
-
-
 # -----------------------------
 # SIDEBAR CONTROLS
 # -----------------------------
@@ -582,16 +726,9 @@ st.sidebar.header("Settings")
 with st.sidebar.expander("Signature Settings", expanded=False):
     SIG_TOL_EARLY = st.number_input(
         "Signature early tolerance (minutes, negative)",
-        value=-15,
+        value=-7,
         step=1,
-        help="Earliest allowed time before session end (e.g., -15 means 15 minutes before).",
-    )
-    SIG_TOL_LATE = st.number_input(
-        "Signature late tolerance (minutes, positive)",
-        value=1440,
-        min_value=0,
-        step=1,
-        help="Latest allowed time after session end (e.g., 30 means up to 30 minutes after).",
+        help="Earliest allowed time before session end (e.g., -7 means 7 minutes before).",
     )
 
 with st.sidebar.expander("Duration / Billing Settings", expanded=False):
@@ -638,9 +775,9 @@ There are **three tabs** in this app:
   **Notes are REQUIRED**. If a note fails parsing compliance, the session fails here.
 
 - **Billed Checker**: Upload Aloha billing status and see billed/unbilled/no-match.
-
 """
     )
+
 
 # -----------------------------
 # TABS
@@ -656,6 +793,7 @@ tab1, tab2, tab3 = st.tabs(
 # Keep external sessions DF across tabs
 if "external_sessions_df" not in st.session_state:
     st.session_state["external_sessions_df"] = None
+
 
 # =========================================================
 # TAB 1: TOOLS – PDF → EXTERNAL SESSION LIST
@@ -680,12 +818,20 @@ with tab1:
                 notes_df = pd.DataFrame(results)
                 st.success(f"Parsed {len(notes_df)} notes from PDF.")
 
-                with st.expander("Preview parsed notes", expanded=False):
-                    st.dataframe(notes_df.head(50))
+                with st.expander("Preview parsed notes (signature debug)", expanded=False):
+                    preview_cols = [
+                        "Client",
+                        "Provider Signature Candidates",
+                        "Provider Signature Valid",
+                        "Compliance Errors",
+                    ]
+                    preview_cols = [c for c in preview_cols if c in notes_df.columns]
+                    st.dataframe(notes_df[preview_cols].head(80), use_container_width=True)
 
                 cols = [
                     "Client",
                     "Session Time",
+                    "Session Date",
                     "Present_Client",
                     "Present_Adult_Caregiver",
                     "Present_Sibling",
@@ -704,7 +850,11 @@ with tab1:
                 )
 
                 ext_df = normalize_cols(ext_df)
-                ext_df = ext_df[ext_df["Client"].notna()]
+                ext_df = ext_df[ext_df["Client"].notna()].copy()
+
+                # ✅ Row-by-row key (must be stable)
+                ext_df = ext_df.reset_index(drop=True)
+                ext_df["_RowKey"] = np.arange(len(ext_df), dtype=int)
 
                 st.session_state["external_sessions_df"] = ext_df
 
@@ -783,9 +933,9 @@ def sig_ok_base(row) -> bool:
 
     checks = []
     if not pd.isna(parent_sig_ts):
-        checks.append(within_time_tol(parent_sig_ts, base_ts, SIG_TOL_EARLY, SIG_TOL_LATE))
+        checks.append(within_time_tol(parent_sig_ts, base_ts, SIG_TOL_EARLY))
     if not pd.isna(user_sig_ts):
-        checks.append(within_time_tol(user_sig_ts, base_ts, SIG_TOL_EARLY, SIG_TOL_LATE))
+        checks.append(within_time_tol(user_sig_ts, base_ts, SIG_TOL_EARLY))
 
     return all(checks) if checks else False
 
@@ -878,7 +1028,7 @@ def get_failure_reasons(row) -> str:
 
     # Signature failures (after override)
     if not eval_res["sig_ok"]:
-        tol_str = f"{SIG_TOL_EARLY}/+{SIG_TOL_LATE}"
+        tol_str = f"{SIG_TOL_EARLY}"
         if USE_TIME_ADJ_OVERRIDE and not eval_res["has_time_adj_sig"]:
             reasons.append(
                 f"Signature not within {tol_str} minutes of end time (no time-adjustment override)"
@@ -947,6 +1097,9 @@ with tab2:
         & (df["Session"].astype(str).str.strip() == SESSION_REQUIRED)
     ].copy()
 
+    df_f = df_f.reset_index(drop=True)
+    df_f["_RowKey"] = np.arange(len(df_f), dtype=int)
+
     # ---------- Parse Duration ----------
     df_f["Actual Minutes"] = df_f["Duration"].apply(parse_duration_to_minutes)
 
@@ -964,21 +1117,34 @@ with tab2:
     df_f["Staff Name"] = df_f["User"].apply(normalize_name)
     df_f["Client Name"] = df_f["Client"].apply(normalize_name)
 
-    # ---------- Match to external Client/Session Time list ----------
+    # ---------- Match to external notes ONE-BY-ONE (RowKey) ----------
     ext_df = normalize_cols(external_sessions_df)
 
-    if not ensure_cols(ext_df, ["Client", "Session Time", "Note Parse PASS", "Note Compliance Errors"], "External Sessions (from Tab 1)"):
+    if not ensure_cols(ext_df, ["_RowKey", "Session Time", "Note Parse PASS", "Note Compliance Errors"], "External Sessions (from Tab 1)"):
         st.stop()
 
-    ext_df["Client Name"] = ext_df["Client"].apply(normalize_name)
-    ext_df["SessionIndex"] = ext_df.groupby("Client Name").cumcount()
+    # ✅ Safety check: counts MUST match
+    if len(ext_df) != len(df_f):
+        st.error(
+            f"Row-by-row matching requires the SAME row count.\n\n"
+            f"Sessions (after filters): {len(df_f)}\n"
+            f"Notes parsed (Tab 1): {len(ext_df)}\n\n"
+            "This is unsafe to match one-by-one because a row is missing on one side."
+        )
+        with st.expander("Debug: first 20 rows of each", expanded=False):
+            st.write("Sessions (first 20):")
+            st.dataframe(df_f[["AlohaABA Appointment ID", "Client", "User", "Start date", "Duration"]].head(20))
+            st.write("External notes (first 20):")
+            st.dataframe(ext_df[["_RowKey", "Client", "Session Date", "Session Time", "Note Parse PASS"]].head(20))
+        st.stop()
 
-    df_f = df_f.sort_values(by=["Client Name", "Date", "Start date"], na_position="last").reset_index(drop=True)
-    df_f["SessionIndex"] = df_f.groupby("Client Name").cumcount()
+    # Avoid column collision with sessions file "Client"
+    ext_merge = ext_df.rename(columns={"Client": "Client (PDF)"}).copy()
 
     merge_cols = [
-        "Client Name",
-        "SessionIndex",
+        "_RowKey",
+        "Client (PDF)",
+        "Session Date",
         "Session Time",
         "Present_Client",
         "Present_Adult_Caregiver",
@@ -987,11 +1153,11 @@ with tab2:
         "Note Parse PASS",
         "Note Compliance Errors",
     ]
-    merge_cols = [c for c in merge_cols if c in ext_df.columns]
+    merge_cols = [c for c in merge_cols if c in ext_merge.columns]
 
     df_f = df_f.merge(
-        ext_df[merge_cols],
-        on=["Client Name", "SessionIndex"],
+        ext_merge[merge_cols],
+        on="_RowKey",
         how="left",
         sort=False,
     )
@@ -999,13 +1165,13 @@ with tab2:
     # Note parse gate: if no match or parse fail => False
     df_f["_NoteParseOk"] = df_f["Note Parse PASS"].fillna(False).astype(bool)
 
-    # Derive Has External Session from non-blank Session Time
+    # External session presence based on Session Time text
     df_f["Has External Session"] = (
         df_f["Session Time"].notna()
         & (df_f["Session Time"].astype(str).str.strip() != "")
     )
 
-    # Derive external start/end + set internal end
+    # Derive external start/end from Session Time + Date (already computed earlier)
     df_f[["_ExtStart_dt", "_ExtEnd_dt"]] = df_f.apply(
         lambda r: pd.Series(parse_session_time_range(r.get("Session Time"), r.get("Date"))),
         axis=1,
@@ -1307,7 +1473,7 @@ with tab3:
                         if c in merged.columns
                     ]
 
-                    billed_dl = billed_df[dl_cols]
+                    billed_dl = merged[merged["Billing Status"] == "Billed"][dl_cols]
                     unbilled_clean_dl = unbilled_clean_df[dl_cols]
                     unbilled_flagged_dl = unbilled_flagged_df[dl_cols]
                     nomatch_dl = nomatch_df[dl_cols]

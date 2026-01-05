@@ -120,12 +120,13 @@ def normalize_session_time(raw: str) -> str:
 
 
 
+
 def normalize_date(raw: str) -> str:
     """
     Accepts:
       - 2025/10/28  (YYYY/MM/DD)
       - 10/28/2025  (MM/DD/YYYY)
-    Returns normalized 'YYYY/MM/DD' when possible, else the stripped raw string.
+    Returns normalized 'MM/DD/YYYY' when possible, else the stripped raw string.
     """
     if not raw:
         return ""
@@ -133,7 +134,7 @@ def normalize_date(raw: str) -> str:
     raw = raw.strip()
     m = re.match(r'^(\d{1,4})/(\d{1,2})/(\d{1,4})$', raw)
     if not m:
-        return raw  # unexpected format, just return as-is
+        return raw  # unexpected format, return as-is
 
     a, b, c = m.groups()
     a_i, b_i, c_i = int(a), int(b), int(c)
@@ -148,7 +149,7 @@ def normalize_date(raw: str) -> str:
         # fallback: assume last is year
         year, month, day = c_i, a_i, b_i
 
-    return f"{year:04d}/{month:02d}/{day:02d}"
+    return f"{month:02d}/{day:02d}/{year:04d}"
 
 
 def parse_notes(text: str):
@@ -303,17 +304,18 @@ def export_excel(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
-def within_time_tol(
-    sig_ts: pd.Timestamp,
-    base_ts: pd.Timestamp,
-    tol_early_min: float,
-    tol_late_min: float,
-) -> bool:
+def within_time_tol(sig_ts, base_ts, tol_early_min):
+    """
+    Signature must not be earlier than tol_early_min minutes before session end.
+    There is NO upper (late) limit.
+    """
     if pd.isna(sig_ts) or pd.isna(base_ts):
         return False
 
     diff_min = (sig_ts - base_ts).total_seconds() / 60.0
-    return (diff_min >= tol_early_min) and (diff_min <= tol_late_min)
+
+    # Only enforce early limit
+    return diff_min >= tol_early_min
 
 
 def normalize_name(name: Any) -> str:
@@ -380,13 +382,6 @@ with st.sidebar.expander("Signature Settings", expanded=False):
         value=-15,
         step=1,
         help="Earliest allowed time before session end (e.g., -15 means 15 minutes before).",
-    )
-    SIG_TOL_LATE = st.number_input(
-        "Signature late tolerance (minutes, positive)",
-        value=1440,
-        min_value=0,
-        step=1,
-        help="Latest allowed time after session end (e.g., 30 means up to 30 minutes after).",
     )
 
 with st.sidebar.expander("Duration / Billing Settings", expanded=False):
@@ -689,7 +684,6 @@ def sig_ok_base(row) -> bool:
                 parent_sig_ts,
                 base_ts,
                 SIG_TOL_EARLY,
-                SIG_TOL_LATE,
             )
         )
 
@@ -699,7 +693,6 @@ def sig_ok_base(row) -> bool:
                 user_sig_ts,
                 base_ts,
                 SIG_TOL_EARLY,
-                SIG_TOL_LATE,
             )
         )
 
@@ -780,7 +773,7 @@ def get_failure_reasons(row) -> str:
 
     # Signature failures (after considering override)
     if not eval_res["sig_ok"]:
-        tol_str = f"{SIG_TOL_EARLY}/+{SIG_TOL_LATE}"
+        tol_str = f"not earlier than {abs(SIG_TOL_EARLY)} minutes before session end"
         if USE_TIME_ADJ_OVERRIDE and not eval_res["has_time_adj_sig"]:
             reasons.append(
                 f"Signature not within {tol_str} minutes of end time "

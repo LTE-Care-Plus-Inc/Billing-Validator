@@ -1,2 +1,4 @@
 venv/
 .streamlit/
+.pytest_cache/
+.__pycache__/
