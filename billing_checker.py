@@ -794,7 +794,8 @@ def within_time_tol(sig_ts, base_ts, tol_early_min):
     diff_min = (sig_ts - base_ts).total_seconds() / 60.0
 
     # Only enforce early limit
-    return diff_min >= tol_early_min
+    return diff_min > tol_early_min
+
 
 
 def normalize_name(name: Any) -> str:
@@ -1018,7 +1019,8 @@ def duration_ok_base(row) -> bool:
     if m <= MAX_MINUTES:
         return True
 
-    return (m - MAX_MINUTES) <= BILLING_TOL
+    return (m - MAX_MINUTES) < BILLING_TOL
+
 
 
 def external_time_ok(row) -> bool:
