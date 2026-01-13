@@ -187,10 +187,13 @@ def normalize_session_time(raw: str) -> str:
             if not conv:
                 return None
             h12, inferred_ampm = conv
-            final_ampm = ampm.upper() if ampm else inferred_ampm
+
+            # 🚨 IMPORTANT FIX:
+            # If hour > 12, it is DEFINITELY PM
+            final_ampm = inferred_ampm
+
             return f"{h12:02d}:{minute:02d} {final_ampm}"
-        else:
-            return f"{h:02d}:{minute:02d} {ampm.upper()}"
+
 
     left = to_display(sh, sm, s_ampm)
     right = to_display(eh, em, e_ampm)
