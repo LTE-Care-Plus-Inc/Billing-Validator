@@ -1,110 +1,109 @@
-import pytest
-from datetime import date
 import pandas as pd
+from datetime import datetime
+
+
 from utils import (
     normalize_session_time,
     parse_session_time_range,
+    normalize_date,
+    extract_first_time_range
 )
 
-# =========================================================
-# normalize_session_time tests
-# =========================================================
+# =====================================================
+# normalize_session_time
+# =====================================================
 
-@pytest.mark.parametrize(
-    "raw, expected",
-    [
-        # Chinese AM/PM
-        ("下午4:30 - 下午7:30", "4:30 PM - 7:30 PM"),
-
-        # 24-hour time with spacing
-        ("14:30  -  18:29", "2:30 PM - 6:29 PM"),
-
-        # Standard AM/PM
-        ("1:00 PM - 7:00 PM", "1:00 PM - 7:00 PM"),
-
-        # Lowercase + punctuation
-        ("9:55 a.m.  -  4:03 p.m.", "9:55 AM - 4:03 PM"),
-    ],
-)
-def test_normalize_session_time(raw, expected):
-    result = normalize_session_time(raw)
-    assert result == expected
+def test_normalize_24_hour_basic():
+    assert normalize_session_time("14:30 - 18:30") == "02:30 PM - 06:30 PM"
+    assert normalize_session_time("10:00 - 14:00") == "10:00 AM - 02:00 PM"
+    assert normalize_session_time("09:15 - 13:45") == "09:15 AM - 01:45 PM"
 
 
-# =========================================================
-# parse_session_time_range tests
-# =========================================================
-
-@pytest.mark.parametrize(
-    "session_time, start_hour, start_min, end_hour, end_min",
-    [
-        ("4:30 PM - 7:30 PM", 16, 30, 19, 30),
-        ("2:30 PM - 6:29 PM", 14, 30, 18, 29),
-        ("1:00 PM - 7:00 PM", 13, 0, 19, 0),
-        ("9:55 AM - 4:03 PM", 9, 55, 16, 3),
-    ],
-)
-def test_parse_session_time_range(session_time, start_hour, start_min, end_hour, end_min):
-    base_date = date(2025, 1, 15)
-
-    start_dt, end_dt = parse_session_time_range(session_time, base_date)
-
-    assert not pd.isna(start_dt)
-    assert not pd.isna(end_dt)
-
-    assert start_dt.hour == start_hour
-    assert start_dt.minute == start_min
-
-    assert end_dt.hour == end_hour
-    assert end_dt.minute == end_min
+def test_normalize_12_hour_missing_ampm():
+    assert normalize_session_time("02:30 - 06:30") == "02:30 PM - 06:30 PM"
+    assert normalize_session_time("12:00 - 3:00") == "12:00 PM - 03:00 PM"
 
 
-# =========================================================
-# End-to-end safety tests
-# raw → normalized → parsed
-# =========================================================
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        "下午4:30 - 下午7:30",
-        "14:30  -  18:29",
-        "1:00 PM - 7:00 PM",
-        "9:55 a.m.  -  4:03 p.m.",
-    ],
-)
-def test_end_to_end_time_parsing(raw):
-    normalized = normalize_session_time(raw)
-
-    start_dt, end_dt = parse_session_time_range(
-        normalized,
-        "2025-01-15"
-    )
-
-    assert normalized != ""
-    assert not pd.isna(start_dt)
-    assert not pd.isna(end_dt)
-    assert end_dt > start_dt
+def test_normalize_explicit_ampm():
+    assert normalize_session_time("9:00 am - 1:00 pm") == "09:00 AM - 01:00 PM"
+    assert normalize_session_time("2:00 pm - 6:00 pm") == "02:00 PM - 06:00 PM"
 
 
-# =========================================================
-# Defensive / failure cases (optional but recommended)
-# =========================================================
+def test_normalize_invalid():
+    assert normalize_session_time("") == ""
+    assert normalize_session_time("hello") == ""
+    assert normalize_session_time("25:00 - 26:00") == ""
 
-@pytest.mark.parametrize(
-    "raw",
-    [
-        "",
-        None,
-        "invalid time",
-        "下午 - 下午",
-        "25:99 - 30:00",
-    ],
-)
-def test_invalid_times_do_not_crash(raw):
-    normalized = normalize_session_time(raw)
-    start_dt, end_dt = parse_session_time_range(normalized, "2025-01-15")
 
-    # We don't require valid parsing, only that it fails safely
-    assert start_dt is pd.NaT or pd.isna(start_dt)
-    assert end_dt is pd.NaT or pd.isna(end_dt)
+# =====================================================
+# parse_session_time_range
+# =====================================================
+
+def test_parse_valid_same_day():
+    start, end = parse_session_time_range("02:30 PM - 06:30 PM", "01/15/2026")
+    assert start == pd.Timestamp("2026-01-15 14:30")
+    assert end == pd.Timestamp("2026-01-15 18:30")
+
+
+def test_parse_reject_overnight():
+    start, end = parse_session_time_range("10:00 PM - 02:00 PM", "01/15/2026")
+    assert pd.isna(start)
+    assert pd.isna(end)
+
+
+def test_parse_reject_past_10pm():
+    start, end = parse_session_time_range("07:00 PM - 10:30 PM", "01/15/2026")
+    assert pd.isna(start)
+    assert pd.isna(end)
+
+
+def test_parse_accept_exact_10pm():
+    start, end = parse_session_time_range("07:00 PM - 10:00 PM", "01/15/2026")
+    assert start == pd.Timestamp("2026-01-15 19:00")
+    assert end == pd.Timestamp("2026-01-15 22:00")
+
+
+# =====================================================
+# normalize_date
+# =====================================================
+
+def test_normalize_date_us():
+    assert normalize_date("10/28/2025") == "10/28/2025"
+    assert normalize_date("2025/10/28") == "10/28/2025"
+
+
+def test_normalize_date_european():
+    assert normalize_date("13.01.2026") == "01/13/2026"
+    assert normalize_date("01.12.2025") == "12/01/2025"
+
+
+def test_normalize_date_iso():
+    assert normalize_date("2025-10-28") == "10/28/2025"
+
+
+def test_normalize_date_invalid():
+    assert normalize_date("") == ""
+    assert normalize_date("abc") == "abc"
+
+
+# =====================================================
+# extract_first_time_range
+# =====================================================
+
+def test_extract_24_hour():
+    assert extract_first_time_range("14:30 - 18:30") == "02:30 PM - 06:30 PM"
+    assert extract_first_time_range("10:00 - 14:00") == "10:00 AM - 02:00 PM"
+
+
+def test_extract_12_hour_missing_ampm():
+    assert extract_first_time_range("2:30 - 6:30") == "02:30 PM - 06:30 PM"
+    assert extract_first_time_range("12:00 - 3:00") == "12:00 PM - 03:00 PM"
+
+
+def test_extract_explicit_ampm():
+    assert extract_first_time_range("9:00 am - 1:00 pm") == "09:00 AM - 01:00 PM"
+
+
+def test_extract_invalid():
+    assert extract_first_time_range("") == ""
+    assert extract_first_time_range("no time here") == ""

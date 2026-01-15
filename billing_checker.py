@@ -3,7 +3,14 @@ import re
 import unicodedata
 from typing import Any
 from difflib import SequenceMatcher
-
+from utils import (
+    normalize_date,
+    normalize_session_time,
+    parse_session_time_range,
+    clean_time_text,
+    extract_first_time_range,
+    
+)
 import fitz
 import numpy as np
 import pandas as pd
@@ -101,273 +108,6 @@ def pdf_bytes_to_text(pdf_bytes: bytes, preserve_layout: bool = True) -> str:
 
     doc.close()
     return "".join(all_text)
-
-
-# =========================================================
-# Session Time helpers (same behavior as your imported utils)
-# =========================================================
-_TIME_RANGE_ANYWHERE_RE = re.compile(
-    r"(?P<s_h>\d{1,2})\s*:\s*(?P<s_m>\d{2})\s*(?P<s_ampm>am|pm|AM|PM)?"
-    r"\s*-\s*"
-    r"(?P<e_h>\d{1,2})\s*:\s*(?P<e_m>\d{2})\s*(?P<e_ampm>am|pm|AM|PM)?"
-)
-
-
-def normalize_session_time(raw: str) -> str:
-    """
-    Normalize session time into canonical form:
-      'HH:MM AM - HH:MM PM'  (HH is zero-padded)
-    Returns empty string if we cannot confidently parse a time range.
-    """
-    if raw is None:
-        return ""
-
-    s = unicodedata.normalize("NFKC", str(raw))
-    # remove private-use unicode (where 􀀀 junk often lives)
-    s = "".join(ch for ch in s if unicodedata.category(ch) != "Co")
-
-    s = s.replace("\u00a0", " ").strip()
-    if not s:
-        return ""
-
-    # Normalize dashes & spacing
-    s = s.replace("–", "-").replace("—", "-").replace("−", "-")
-    s = re.sub(r"\s+", " ", s)
-
-    # Normalize a.m./p.m. variants -> am/pm
-    s_low = s.lower()
-    s_low = re.sub(r"\b(a\s*\.?\s*m\s*\.?)\b", "am", s_low)
-    s_low = re.sub(r"\b(p\s*\.?\s*m\s*\.?)\b", "pm", s_low)
-    s = s_low
-
-    # Pull FIRST time range from anywhere in the string
-    m = _TIME_RANGE_ANYWHERE_RE.search(s)
-    if not m:
-        return ""
-
-    sh = int(m.group("s_h"))
-    sm = int(m.group("s_m"))
-    eh = int(m.group("e_h"))
-    em = int(m.group("e_m"))
-    s_ampm = (m.group("s_ampm") or "").lower()
-    e_ampm = (m.group("e_ampm") or "").lower()
-
-    # validate minutes
-    if sm > 59 or em > 59:
-        return ""
-
-    # If only one side has am/pm, apply it to both
-    if s_ampm and not e_ampm:
-        e_ampm = s_ampm
-    if e_ampm and not s_ampm:
-        s_ampm = e_ampm
-
-    def hour_to_12h(hour_0_23: int):
-        if hour_0_23 < 0 or hour_0_23 > 23:
-            return None
-        ampm = "AM" if hour_0_23 < 12 else "PM"
-        h12 = hour_0_23 % 12
-        if h12 == 0:
-            h12 = 12
-        return h12, ampm
-
-    # If neither has am/pm, infer (HiRasmus PDF common case)
-    if not s_ampm and not e_ampm:
-        # Conservative heuristic: after-school/evening tends to be PM
-        if sh == 12 or sh >= 4:
-            s_ampm = e_ampm = "pm"
-        else:
-            s_ampm = e_ampm = "am"
-
-    # If hour looks like 24h (e.g., 13:00) and am/pm is missing (rare), convert via 24h logic
-    # Otherwise treat as 12h input.
-    def to_display(h: int, minute: int, ampm: str):
-        if h > 12 or h == 0:
-            conv = hour_to_12h(h)
-            if not conv:
-                return None
-            h12, inferred_ampm = conv
-
-            # 🚨 IMPORTANT FIX:
-            # If hour > 12, it is DEFINITELY PM
-            final_ampm = inferred_ampm
-
-            return f"{h12:02d}:{minute:02d} {final_ampm}"
-
-
-    left = to_display(sh, sm, s_ampm)
-    right = to_display(eh, em, e_ampm)
-    if not left or not right:
-        return ""
-
-    return f"{left} - {right}"
-
-
-def parse_session_time_range(session_time: Any, base_date: Any):
-    """
-    Parse '3:00 PM - 9:00 PM' into (start_dt, end_dt), using base_date.
-    """
-    if pd.isna(session_time):
-        return pd.NaT, pd.NaT
-
-    text = str(session_time).replace("\xa0", " ").strip()
-    if not text or "-" not in text:
-        return pd.NaT, pd.NaT
-
-    start_str, end_str = [part.strip() for part in text.split("-", 1)]
-
-    if pd.isna(base_date):
-        date_str = "1900-01-01"
-    else:
-        date_str = str(base_date)
-
-    start_dt = pd.to_datetime(f"{date_str} {start_str}", errors="coerce")
-    end_dt = pd.to_datetime(f"{date_str} {end_str}", errors="coerce")
-
-    return start_dt, end_dt
-
-
-def normalize_date(raw: str) -> str:
-    """
-    Accepts:
-      - 2025/10/28  (YYYY/MM/DD)
-      - 10/28/2025  (MM/DD/YYYY)
-      - 2025-10-28  (YYYY-MM-DD)  [optional support]
-    Returns normalized 'MM/DD/YYYY' when possible, else the stripped raw string.
-    """
-    if not raw:
-        return ""
-
-    raw = str(raw).strip()
-    if not raw:
-        return ""
-
-    # Optional: support YYYY-MM-DD too
-    m_dash = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", raw)
-    if m_dash:
-        y, mo, d = map(int, m_dash.groups())
-        return f"{mo:02d}/{d:02d}/{y:04d}"
-
-    m = re.match(r"^(\d{1,4})/(\d{1,2})/(\d{1,4})$", raw)
-    if not m:
-        return raw  # unexpected format, return as-is
-
-    a, b, c = m.groups()
-    a_i, b_i, c_i = int(a), int(b), int(c)
-
-    # Case 1: YYYY/MM/DD
-    if len(a) == 4:
-        year, month, day = a_i, b_i, c_i
-    # Case 2: MM/DD/YYYY
-    elif len(c) == 4:
-        year, month, day = c_i, a_i, b_i
-    else:
-        # fallback: assume last is year
-        year, month, day = c_i, a_i, b_i
-
-    return f"{month:02d}/{day:02d}/{year:04d}"
-
-
-
-# =========================================================
-# PDF TEXT CLEANING + TIME NORMALIZATION (for parser)
-# =========================================================
-def strip_private_use(s: str) -> str:
-    """Remove private-use unicode chars (where the '􀀀' junk usually lives)."""
-    if s is None:
-        return ""
-    s = str(s)
-
-    # ✅ NEW: remove the PDF "replacement" character (shows as ��)
-    s = s.replace("\ufffd", "")
-
-    return "".join(ch for ch in s if unicodedata.category(ch) != "Co")
-
-
-
-def clean_time_text(s: str) -> str:
-    """Normalize PDF-extracted time text into something parseable."""
-    if not s:
-        return ""
-    s = strip_private_use(s)
-
-    # normalize unicode width and punctuation
-    s = unicodedata.normalize("NFKC", s)
-
-    # unify dash variants
-    s = s.replace("–", "-").replace("—", "-").replace("−", "-")
-
-    # normalize AM/PM variants
-    s_low = s.lower()
-    s_low = s_low.replace("a.m.", "am").replace("p.m.", "pm")
-    s_low = s_low.replace("a. m.", "am").replace("p. m.", "pm")
-    s = s_low
-
-    # clean spacing around hyphen
-    s = re.sub(r"\s*-\s*", " - ", s)
-
-    # collapse whitespace
-    s = " ".join(s.split()).strip()
-    return s
-
-
-_TIME_RANGE_RE = re.compile(
-    r"(?P<s_h>\d{1,2})\s*:\s*(?P<s_m>\d{2})\s*(?P<s_ampm>am|pm)?"
-    r"\s*-\s*"
-    r"(?P<e_h>\d{1,2})\s*:\s*(?P<e_m>\d{2})\s*(?P<e_ampm>am|pm)?",
-    re.I
-)
-
-
-def extract_first_time_range(raw: str) -> str:
-    """
-    Returns a normalized time range string like:
-      '12:30 PM - 04:30 PM' or '05:00 PM - 09:30 PM'
-    If AM/PM is missing, we infer with a conservative heuristic.
-    """
-    raw = clean_time_text(raw)
-    if not raw:
-        return ""
-
-    m = _TIME_RANGE_RE.search(raw)
-    if not m:
-        return ""
-
-    sh = int(m.group("s_h"))
-    sm = int(m.group("s_m"))
-    eh = int(m.group("e_h"))
-    em = int(m.group("e_m"))
-    s_ampm = (m.group("s_ampm") or "").lower()
-    e_ampm = (m.group("e_ampm") or "").lower()
-
-    def fmt(h, minute, ampm):
-        return f"{h:02d}:{minute:02d} {ampm.upper()}"
-
-    # If only one side has am/pm, apply it to both
-    if s_ampm and not e_ampm:
-        e_ampm = s_ampm
-    if e_ampm and not s_ampm:
-        s_ampm = e_ampm
-
-    # If neither has am/pm, infer
-    if not s_ampm and not e_ampm:
-        if sh == 12 or sh >= 4:
-            s_ampm = e_ampm = "pm"
-        else:
-            s_ampm = e_ampm = "am"
-
-    def to_12h(hour, ampm):
-        hour = hour % 12
-        if hour == 0:
-            hour = 12
-        return hour, ampm
-
-    sh12, s_ampm = to_12h(sh, s_ampm)
-    eh12, e_ampm = to_12h(eh, e_ampm)
-
-    return f"{fmt(sh12, sm, s_ampm)} - {fmt(eh12, em, e_ampm)}"
-
-
 # =========================================================
 # Provider signature parsing + validation
 # =========================================================
@@ -379,6 +119,7 @@ def _clean_pdf_line(s: str) -> str:
     s = "".join(ch for ch in s if ch.isprintable())
     s = " ".join(s.split())
     return s.strip()
+
 
 
 def extract_provider_signature_candidates(block_text: str) -> list[str]:
@@ -761,20 +502,8 @@ def parse_duration_to_minutes(d: Any) -> float:
         return np.nan
     return np.nan
 def normalize_client_name_for_match(name: Any) -> str:
-    """
-    Normalize client names into 'Last, First' ONLY.
-    This prevents mismatches caused by middle initials like 'Doe, John E'.
-    """
-    base = normalize_name(name)  # returns 'Last, First Middle'
-    if not base:
-        return ""
-    if "," not in base:
-        return base
+    return normalize_name(name)
 
-    last, rest = [p.strip() for p in base.split(",", 1)]
-    rest_parts = rest.split()
-    first = rest_parts[0] if rest_parts else ""
-    return f"{last}, {first}".strip().strip(",")
 
 
 def export_excel(df: pd.DataFrame) -> bytes:
@@ -803,8 +532,7 @@ def within_time_tol(sig_ts, base_ts, tol_early_min):
 
 def normalize_name(name: Any) -> str:
     """
-    Normalize names into: 'Last, First Middle' (proper-cased).
-    Handles already-comma format like 'Last, First'.
+    Normalize names into STRICT: 'Last, First' (proper-cased).
     """
     if pd.isna(name):
         return ""
@@ -812,25 +540,17 @@ def normalize_name(name: Any) -> str:
     if not s:
         return ""
 
-    def proper_case_block(block: str) -> str:
-        block = " ".join(block.split())
-        return " ".join(w.capitalize() for w in block.split())
+    parts = s.replace(",", " ").split()
+    parts = [p.capitalize() for p in parts if p]
 
-    if "," in s:
-        last, rest = [p.strip() for p in s.split(",", 1)]
-        last = proper_case_block(last)
-        rest = proper_case_block(rest)
-        return f"{last}, {rest}" if rest else last
-
-    parts = s.split()
     if len(parts) == 1:
-        return proper_case_block(parts[0])
+        return parts[0]
 
-    last_raw = parts[-1]
-    first_middle_raw = " ".join(parts[:-1])
-    last = proper_case_block(last_raw)
-    first_middle = proper_case_block(first_middle_raw)
-    return f"{last}, {first_middle}"
+    first = parts[0]
+    last = parts[-1]
+
+    return f"{last}, {first}"
+
 
 
 # -----------------------------
