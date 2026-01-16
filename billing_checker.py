@@ -900,8 +900,7 @@ def get_failure_reasons(row) -> str:
             reasons.append("Missing Duration data")
         else:
             reasons.append(
-                f"Duration ({actual_min:.0f} min) is outside allowed range "
-                f"({MIN_MINUTES}-{MAX_MINUTES} min, +{BILLING_TOL} min tolerance over max)"
+                f"Duration ({actual_min:.0f} min) must be between {MIN_MINUTES} and {MAX_MINUTES} minutes"
             )
 
     # Signature failures
@@ -910,7 +909,7 @@ def get_failure_reasons(row) -> str:
         if pd.isna(row.get("_ParentSig_dt", pd.NaT)):
             reasons.append("Missing Parent signature time (required)")
         else:
-            reasons.append(f"Parent signature not within {tol_str} minutes of end time")
+            reasons.append(f"The parent signature must be within {tol_str} minutes of when the session end time")
 
 
     # Daily total failures
@@ -919,7 +918,7 @@ def get_failure_reasons(row) -> str:
         if not pd.isna(daily_min):
             reasons.append(
                 f"Total daily duration for this BT on {row.get('Date')} "
-                f"({daily_min:.0f} min) exceeds {DAILY_MAX_MINUTES} min + {DAILY_TOL} min tolerance"
+                f"({daily_min:.0f} min) exceeds {DAILY_MAX_MINUTES} min"
             )
 
     # Attendance failures
