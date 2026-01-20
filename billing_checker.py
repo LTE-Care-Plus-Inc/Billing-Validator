@@ -37,7 +37,7 @@ BILLING_TOL_DEFAULT = 8      # up to 8 min over MAX allowed
 DAILY_MAX_MINUTES = 480      # <= 8 hours per BT per day
 
 # Column name for time-adjustment parent approval signature
-TIME_ADJ_COL = "Parent’s Signature Approval for Time Adjustment signature"
+TIME_ADJ_COL = "Adult Caregiver’s Signature Approval for Time Adjustment signature"
 
 # Required columns in the uploaded sessions file
 REQ_COLS = [
@@ -46,7 +46,7 @@ REQ_COLS = [
     "Client",
     "Duration",
     "Session",
-    "Parent signature time",
+    "Adult Caregiver signature time",
     "User",
     "Start date",   # mandatory date column from HiRasmus
 ]
@@ -907,7 +907,7 @@ def get_failure_reasons(row) -> str:
     if not eval_res["sig_ok"]:
         tol_str = f"not earlier than {abs(SIG_TOL_EARLY)} minutes before session end"
         if pd.isna(row.get("_ParentSig_dt", pd.NaT)):
-            reasons.append("Missing Parent signature time (required)")
+            reasons.append("Missing Adult Caregiver signature time (required)")
         else:
             reasons.append(f"The parent signature must be within {tol_str} minutes of when the session end time")
 
@@ -1015,7 +1015,7 @@ with tab2:
 
     # Signature timestamps
     df_f["_End_dt"] = pd.NaT
-    df_f["_ParentSig_dt"] = pd.to_datetime(df_f["Parent signature time"], errors="coerce")
+    df_f["_ParentSig_dt"] = pd.to_datetime(df_f["Adult Caregiver signature time"], errors="coerce")
 
 
     # ---------- Normalize names ----------
@@ -1177,7 +1177,7 @@ with tab2:
 
     # ---------- Pretty-print signature columns ----------
     for col in [
-    "Parent signature time",
+    "Adult Caregiver signature time",
     ]:
         if col in df_f.columns:
             df_f[col] = (
@@ -1198,7 +1198,7 @@ with tab2:
         "Duration",
         "Actual Minutes",
         "Daily Minutes",
-        "Parent signature time",
+        "Adult Caregiver signature time",
         "Session Time",
         "Note Compliance Errors",
     ]
