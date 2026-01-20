@@ -118,9 +118,10 @@ def parse_session_time_range(session_time: Any, base_date: Any):
     if end_dt <= start_dt:
         return pd.NaT, pd.NaT
 
-    # ❌ Hard cutoff: 10:00 PM
-    if end_dt.hour > 22 or (end_dt.hour == 22 and end_dt.minute > 0):
+# ❌ Hard cutoff: before 10:08 PM
+    if end_dt.hour > 22 or (end_dt.hour == 22 and end_dt.minute >= 8):
         return pd.NaT, pd.NaT
+
 
     return start_dt, end_dt
 
