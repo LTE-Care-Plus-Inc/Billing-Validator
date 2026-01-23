@@ -129,47 +129,63 @@ def parse_session_time_range(session_time: Any, base_date: Any):
 
 def normalize_date(raw: str) -> str:
     """
-    Accepts:
-      - 2025/10/28  (YYYY/MM/DD)
-      - 10/28/2025  (MM/DD/YYYY)
-      - 2025-10-28  (YYYY-MM-DD)  [optional support]
-    Returns normalized 'MM/DD/YYYY' when possible, else the stripped raw string.
+    Normalize dates to MM/DD/YYYY.
+
+    Supported:
+    - DD.MM.YYYY  (European dotted)
+    - DD/MM/YYYY  (European slash, inferred if day > 12)
+    - MM/DD/YYYY  (US)
+    - YYYY-MM-DD, YYYY/MM/DD (ISO / Chinese exports)
+
+    Unsupported formats are returned as-is.
     """
-    if not raw:
+    if raw is None:
         return ""
 
     raw = str(raw).strip()
     if not raw:
         return ""
-    # --- European format: DD.MM.YYYY ---
+
+    # -------------------------------------------------
+    # ISO formats: YYYY-MM-DD or YYYY/MM/DD
+    # -------------------------------------------------
+    m_iso = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$", raw)
+    if m_iso:
+        y, m, d = map(int, m_iso.groups())
+        return f"{m:02d}/{d:02d}/{y:04d}"
+
+    # -------------------------------------------------
+    # European dotted: DD.MM.YYYY
+    # -------------------------------------------------
     m_dot = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$", raw)
     if m_dot:
         d, m, y = map(int, m_dot.groups())
         return f"{m:02d}/{d:02d}/{y:04d}"
-    # Optional: support YYYY-MM-DD too
-    m_dash = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", raw)
-    if m_dash:
-        y, mo, d = map(int, m_dash.groups())
-        return f"{mo:02d}/{d:02d}/{y:04d}"
 
-    m = re.match(r"^(\d{1,4})/(\d{1,2})/(\d{1,4})$", raw)
-    if not m:
-        return raw  # unexpected format, return as-is
+    # -------------------------------------------------
+    # Slash: MM/DD/YYYY or DD/MM/YYYY
+    # -------------------------------------------------
+    m_slash = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", raw)
+    if m_slash:
+        p1, p2, y = map(int, m_slash.groups())
 
-    a, b, c = m.groups()
-    a_i, b_i, c_i = int(a), int(b), int(c)
+        # European if first part is day
+        if p1 > 12 and 1 <= p2 <= 12:
+            day, month = p1, p2
+        # US if second part is day
+        elif p2 > 12 and 1 <= p1 <= 12:
+            month, day = p1, p2
+        else:
+            # Ambiguous → default US
+            month, day = p1, p2
 
-    # Case 1: YYYY/MM/DD
-    if len(a) == 4:
-        year, month, day = a_i, b_i, c_i
-    # Case 2: MM/DD/YYYY
-    elif len(c) == 4:
-        year, month, day = c_i, a_i, b_i
-    else:
-        # fallback: assume last is year
-        year, month, day = c_i, a_i, b_i
+        return f"{month:02d}/{day:02d}/{y:04d}"
 
-    return f"{month:02d}/{day:02d}/{year:04d}"
+    # -------------------------------------------------
+    # Fallback: unsupported format
+    # -------------------------------------------------
+    return raw
+
 
 
 
