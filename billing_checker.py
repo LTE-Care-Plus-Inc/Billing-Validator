@@ -54,7 +54,7 @@ REQ_COLS = [
 # Default toggle value (so helper functions referencing it won’t error)
 USE_TIME_ADJ_OVERRIDE = True
 
-DATE_RE = r"(\d{1,4}/\d{1,2}/\d{1,4})"
+DATE_RE = r"(\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2}|\d{1,2}[-/\.]\d{1,2}[-/\.]\d{4})"
 
 
 # =========================================================
@@ -171,7 +171,7 @@ def any_signature_line_valid(block_text: str) -> tuple[bool, list[str]]:
     for cand in cands:
         if not re.search(r"R?BT", cand, re.I):
             continue
-        if not re.search(r"\b\d{1,4}\s*[/-]\s*\d{1,2}\s*[/-]\s*\d{1,4}\b", cand):
+        if not re.search(r"\b\d{1,4}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{1,4}\b", cand):
             continue
         if not any(ch.isalpha() for ch in cand):
             continue
@@ -206,7 +206,12 @@ def parse_notes(text: str):
         provider = provider_match.group(1).strip() if provider_match else ""
 
         # REQUIRED DEMOGRAPHICS
-        dob_match = re.search(rf"Date of Birth\s*:\s*{DATE_RE}", block, re.I)
+        dob_match = re.search(
+            rf"Date\s*of\s*Birth\s*[:\-]?\s*({DATE_RE})",
+            block,
+            re.I,
+        )
+
         dob = normalize_date(dob_match.group(1)) if dob_match else ""
 
         gender_match = re.search(r"Gender\s*:\s*([^\n\r]+)", block, re.I)
@@ -377,7 +382,7 @@ def parse_notes(text: str):
             compliance_errors.append("Other maladaptive behavior selected but no description provided")
 
         if not data_collected:
-            compliance_errors.append("No measurable session data found")
+            compliance_errors.append("Missing Session Data")
         if not session_summary_present:
             compliance_errors.append("Missing session summary narrative")
         if not outcome_yes:
@@ -889,9 +894,9 @@ def get_failure_reasons(row) -> str:
     if not eval_res["ext_ok"]:
         stime = row.get("Session Time", "")
         if pd.isna(stime) or str(stime).strip() == "":
-            reasons.append("Session Time missing/blank on note (cannot derive start/end)")
+            reasons.append("No Session time on note")
         else:
-            reasons.append("Session Time present but could not be parsed into start/end")
+            reasons.append("Session Time invalid: must be same-day and end before 10:00 PM")
 
     # Duration failures
     if not eval_res["duration_ok"]:
