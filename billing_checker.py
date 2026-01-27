@@ -910,11 +910,10 @@ def get_failure_reasons(row) -> str:
 
     # Signature failures
     if not eval_res["sig_ok"]:
-        tol_str = f"not earlier than {abs(SIG_TOL_EARLY)} minutes before session end"
         if pd.isna(row.get("_ParentSig_dt", pd.NaT)):
             reasons.append("Missing Adult Caregiver signature time (required)")
         else:
-            reasons.append(f"The parent signature must be within {tol_str} minutes of when the session end time")
+            reasons.append(f"Parent signature too early.")
 
 
     # Daily total failures
@@ -923,7 +922,7 @@ def get_failure_reasons(row) -> str:
         if not pd.isna(daily_min):
             reasons.append(
                 f"Total daily duration for this BT on {row.get('Date')} "
-                f"({daily_min:.0f} min) exceeds {DAILY_MAX_MINUTES} min"
+                f"({daily_min:.0f} min) exceeded"
             )
 
     # Attendance failures
