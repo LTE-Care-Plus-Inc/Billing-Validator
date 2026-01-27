@@ -77,9 +77,16 @@ def normalize_session_time(raw: str) -> str:
     if e_ampm and not s_ampm:
         s_ampm = e_ampm
 
-    # No AM/PM → hard business rule: PM for both
+    # No AM/PM → assume 24-hour time for BOTH endpoints.
+    # Example: "9:00 - 12:00" => 09:00 - 12:00 (AM to PM via 24h conversion)
     if not s_ampm and not e_ampm:
-        s_ampm = e_ampm = "pm"
+        # Validate as 24h-style hours (0-23). Note: 1–12 will be treated as AM except 12->PM.
+        if sh > 23 or eh > 23:
+            return ""
+        sh12, sap = from_24h(sh)
+        eh12, eap = from_24h(eh)
+        return f"{fmt(sh12, sm, sap)} - {fmt(eh12, em, eap)}"
+
 
 
     if not (1 <= sh <= 12 and 1 <= eh <= 12):
@@ -293,9 +300,16 @@ def extract_first_time_range(raw: str) -> str:
     if e_ampm and not s_ampm:
         s_ampm = e_ampm
 
-    # No AM/PM → hard business rule: PM for both
+    # Example: "9:00 - 12:00" => 09:00 - 12:00 (AM to PM via 24h conversion)
+    # No AM/PM → assume 24-hour time for BOTH endpoints.
     if not s_ampm and not e_ampm:
-        s_ampm = e_ampm = "pm"
+        if sh > 23 or eh > 23:
+            return ""
+        sh12, sA = from_24h(sh)
+        eh12, eA = from_24h(eh)
+        return f"{fmt(sh12, sm, sA)} - {fmt(eh12, em, eA)}"
+
+
 
     if not (1 <= sh <= 12 and 1 <= eh <= 12):
         return ""
