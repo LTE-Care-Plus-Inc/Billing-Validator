@@ -239,7 +239,7 @@ def parse_notes(text: str):
 
         present_client = bool(re.search(r"\bClient\b", present_text, re.I))
         present_bt = bool(re.search(r"\b(BT/RBT|RBT/BT)\b", present_text, re.I))
-        present_caregiver = bool(re.search(r"\bParent/Caregiver\b", present_text, re.I))
+        present_caregiver = bool(re.search(r"\b(?:Parent/Caregiver|Adult Caregiver)\b", present_text, re.I))
         present_sibling = bool(re.search(r"\bSibling(s)?\b", present_text, re.I))
 
         maladaptive_section = ""
@@ -798,7 +798,7 @@ def get_failure_reasons(row) -> str:
             bool(row.get("_Note_ParentPresent"))
             or bool(row.get("_Note_SiblingPresent"))
         ):
-            missing.append("Parent/Caregiver or Sibling")
+            missing.append("Parent/Caregiver or Adult/Caregiver or Sibling")
 
         reasons.append("Attendance missing: " + ", ".join(missing))
 
