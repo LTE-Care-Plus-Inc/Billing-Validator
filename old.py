@@ -1042,13 +1042,6 @@ with tab2:
 
     display_cols.extend(
         [
-            "_DurationOk",
-            "_SigOk",
-            "_ExtOk",
-            "_DailyOk",
-            "_HasTimeAdjSig",
-            "_NoteOk",
-            "_NoteParseOk",
             "Failure Reasons",
         ]
     )
