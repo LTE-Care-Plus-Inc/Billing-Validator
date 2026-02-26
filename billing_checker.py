@@ -1,500 +1,53 @@
 # ===========================
-# app.py (UPDATED)
-# Matching unchanged; time pipeline centralized
+# app.py
 # ===========================
-import io
 import re
-import unicodedata
-from typing import Any
 from difflib import SequenceMatcher
 
-from utils import (
-    normalize_date,
-    normalize_session_time, 
-    parse_session_time_range,
-    normalize_time_range,
-)
-
-import fitz
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+from constants import (
+    STATUS_REQUIRED,
+    SESSION_REQUIRED,
+    BILLING_TOL_DEFAULT,
+    TIME_ADJ_COL,
+    REQ_COLS,
+    MIN_SESSION_GAP_MINUTES,
+)
+from utils import (
+    normalize_date,
+    normalize_session_time,
+    parse_session_time_range,
+    normalize_time_range,
+    read_any,
+    normalize_cols,
+    ensure_cols,
+    parse_duration_to_minutes,
+    normalize_client_name_for_match,
+    normalize_name,
+    export_excel,
+)
+from parsers import (
+    pdf_bytes_to_text,
+    parse_notes,
+    notes_to_excel_bytes,
+)
+from validators import (
+    evaluate_row,
+    get_failure_reasons,
+    configure as configure_validators,
+)
 
 # -----------------------------
 # PAGE CONFIG
 # -----------------------------
 st.set_page_config(
-    page_title="HiRasmus Billing Session Checker",
+    page_title="Session Compliance Checker",
     layout="wide",
 )
-st.title("HiRasmus Billing Session Checker")
-
-# -----------------------------
-# GLOBAL CONFIG
-# -----------------------------
-STATUS_REQUIRED = "Transferred to AlohaABA"
-SESSION_REQUIRED = "1:1 BT Direct Service"
-
-MIN_MINUTES = 53
-MAX_MINUTES = 360
-BILLING_TOL_DEFAULT = 8
-DAILY_MAX_MINUTES = 480
-
-TIME_ADJ_COL = "Adult Caregiver’s Signature Approval for Time Adjustment signature"
-
-REQ_COLS = [
-    "Status",
-    "AlohaABA Appointment ID",
-    "Client",
-    "Duration",
-    "Session",
-    "Adult Caregiver signature time",
-    "User",
-    "Start date",
-]
-
-USE_TIME_ADJ_OVERRIDE = True
-
-DATE_RE = r"(\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2}|\d{1,2}[-/\.]\d{1,2}[-/\.]\d{4})"
-
-# =========================================================
-# Excel-safe sanitizer
-# =========================================================
-_ILLEGAL_XL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
-
-
-def excel_safe_str(v: Any) -> Any:
-    if v is None:
-        return v
-    if isinstance(v, float) and pd.isna(v):
-        return v
-    s = str(v)
-    s = _ILLEGAL_XL_CHARS_RE.sub("", s)
-    return s
-
-
-def excel_sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
-    df2 = df.copy()
-    for c in df2.columns:
-        if df2[c].dtype == object:
-            df2[c] = df2[c].map(excel_safe_str)
-    return df2
-
-
-# -----------------------------
-# PDF → TEXT (TOOLS TAB)
-# -----------------------------
-def pdf_bytes_to_text(pdf_bytes: bytes, preserve_layout: bool = True) -> str:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    total_pages = len(doc)
-    all_text = []
-
-    for page_num in range(total_pages):
-        page = doc[page_num]
-        if preserve_layout:
-            text = page.get_text(
-                "text",
-                flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES,
-            )
-        else:
-            text = page.get_text("text")
-
-        all_text.append(f"--- Page {page_num + 1} ---\n{text}\n\n")
-
-    doc.close()
-    return "".join(all_text)
-
-
-# =========================================================
-# Provider signature parsing + validation
-# =========================================================
-def _clean_pdf_line(s: str) -> str:
-    if s is None:
-        return ""
-    s = unicodedata.normalize("NFKC", str(s))
-    s = s.replace("\u00a0", " ").replace("􀀀", " ")
-    s = "".join(ch for ch in s if ch.isprintable())
-    s = " ".join(s.split())
-    return s.strip()
-
-
-def extract_provider_signature_candidates(block_text: str) -> list[str]:
-    label_re = re.compile(
-        r"Provider\s+Signatures?\s*(?:/\s*)?Credentials\s+and\s+Date\s*:?\s*",
-        re.I,
-    )
-
-    cands: list[str] = []
-    for m in label_re.finditer(block_text):
-        tail = block_text[m.end(): m.end() + 800]
-        if not tail:
-            continue
-
-        lines = tail.splitlines()
-        first_line = _clean_pdf_line(lines[0]) if len(lines) >= 1 else ""
-
-        rest_lines = [_clean_pdf_line(x) for x in lines[1:10]]
-        rest_lines = [x for x in rest_lines if x]
-
-        pieces = []
-        if first_line:
-            pieces.append(first_line)
-        if rest_lines:
-            pieces.append(rest_lines[0])
-
-        cand = _clean_pdf_line(" ".join(pieces))
-        if cand:
-            cands.append(cand)
-
-    return cands
-
-
-def any_signature_line_valid(block_text: str) -> tuple[bool, list[str]]:
-    cands = extract_provider_signature_candidates(block_text)
-
-    for cand in cands:
-        if not re.search(r"R?BT", cand, re.I):
-            continue
-        if not re.search(r"\b\d{1,4}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{1,4}\b", cand):
-            continue
-        if not any(ch.isalpha() for ch in cand):
-            continue
-        return True, cands
-
-    return False, cands
-
-
-# =========================================================
-# NOTE PARSER
-# =========================================================
-def parse_notes(text: str):
-    blocks = re.split(r"(?=Client\s*:)", text)
-    results = []
-
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
-
-        client_match = re.search(r"Client\s*:\s*([^\n]+)", block)
-        client_name = client_match.group(1).strip() if client_match else ""
-        if not client_name:
-            continue
-
-        provider_match = re.search(r"Rendering Provider\s*:\s*([^\n]+)", block)
-        provider = provider_match.group(1).strip() if provider_match else ""
-
-        dob_match = re.search(rf"Date\s*of\s*Birth\s*[:\-]?\s*({DATE_RE})", block, re.I)
-        dob = normalize_date(dob_match.group(1)) if dob_match else ""
-
-        gender_match = re.search(r"Gender\s*:\s*([^\n\r]+)", block, re.I)
-        gender_raw = gender_match.group(1).strip() if gender_match else ""
-
-        g = gender_raw.strip().lower()
-        if g in ("male", "m", "man", "boy", "男性", "男"):
-            gender = "Male"
-        elif g in ("female", "f", "woman", "girl", "女性", "女"):
-            gender = "Female"
-        else:
-            gender = gender_raw
-
-        diagnosis = ""
-        dx_match = re.search(
-            r"Diagnosis Code\s*\(\s*(?:ICD|IDC)\s*[-\s]*10\s*\)\s*:\s*([A-Za-z0-9\.\s]+)",
-            block,
-            re.I,
-        )
-        if dx_match:
-            raw = dx_match.group(1)
-            icd_match = re.search(r"[A-Za-z]\d{2}(?:\.\d+)?", raw, re.I)
-            if icd_match:
-                diagnosis = icd_match.group(0).upper()
-
-        insurance_match = re.search(r"Primary Insurance\s*:\s*([^\n]+)", block)
-        primary_insurance = insurance_match.group(1).strip() if insurance_match else ""
-
-        ins_id_match = re.search(r"Insurance ID\s*:\s*([A-Z0-9]+)", block, re.I)
-        insurance_id = ins_id_match.group(1).strip() if ins_id_match else ""
-
-        date_match = re.search(rf"Session Date\s*:\s*{DATE_RE}", block, re.I)
-        session_date = normalize_date(date_match.group(1)) if date_match else ""
-
-        # SAME-LINE ONLY policy preserved (unchanged)
-        raw_session_time = ""
-        m_time = re.search(r"(?im)^\s*Session Time\s*:\s*(.*)\s*$", block)
-        if m_time:
-            raw_session_time = m_time.group(1).strip()
-            if raw_session_time in ("-", "–", "—"):
-                raw_session_time = ""
-
-
-        session_time = normalize_time_range(raw_session_time)
-        location_match = re.search(r"Session Location\s*:\s*([^\n]+)", block)
-        session_location = location_match.group(1).strip() if location_match else ""
-
-        present_text = ""
-        pos = block.lower().find("present at session")
-        if pos != -1:
-            present_text = block[pos: pos + 400]
-
-        present_client = bool(re.search(r"\bClient\b", present_text, re.I))
-        present_bt = bool(re.search(r"\b(BT/RBT|RBT/BT)\b", present_text, re.I))
-        present_caregiver = bool(re.search(r"\bAdult Caregiver\b", present_text, re.I))
-        present_sibling = bool(re.search(r"\bSibling(s)?\b", present_text, re.I))
-
-        maladaptive_section = ""
-        section_match = re.search(
-            r"Maladaptive Status\s*:\s*(.*?)(?:\n[A-Z][a-zA-Z ]+?:|\Z)",
-            block,
-            re.S,
-        )
-        if section_match:
-            maladaptive_section = section_match.group(1).strip()
-
-        maladaptive_behaviors = []
-        if maladaptive_section:
-            for line in maladaptive_section.splitlines():
-                clean = line.strip()
-                if not clean:
-                    continue
-
-                lower = clean.lower()
-                if (
-                    lower.endswith(":")
-                    or "continues to display" in lower
-                    or "in the following areas" in lower
-                    or "maladaptive status" in lower
-                    or "other maladaptive behaviors" in lower
-                ):
-                    continue
-
-                clean = re.sub(r"[•▪◦\-–—\uf0b7\uf0a7]+", "", clean).strip()
-
-                if len(clean.split()) > 6 and not clean.lower().startswith("other"):
-                    continue
-
-                maladaptive_behaviors.append(clean.lower())
-
-        other_selected = any(b == "other" or b.startswith("other ") for b in maladaptive_behaviors)
-        other_desc_match = re.search(r"Other maladaptive behaviors\s*:\s*(.+)", block, re.I)
-        other_maladaptive_present = bool(other_desc_match and other_desc_match.group(1).strip())
-
-        data_rows = re.findall(
-            r"\n\s*([A-Za-z][A-Za-z0-9\s,.\-’'()/]+?)\s+([0-9]{1,3})\s+([0-9]{1,3})\s*%?\s*(?=\n|$)",
-            block
-        )
-        data_collected = len(data_rows) > 0
-
-        summary_match = re.search(
-            r"(Session Summary|Summary of Session)\s*:\s*(.+?)(?:\n[A-Z][a-zA-Z ]+?:|\Z)",
-            block,
-            re.I | re.S,
-        )
-        session_summary_present = bool(summary_match and summary_match.group(2).strip())
-
-        bt_attestation_present = bool(
-            re.search(
-                r"\battest\s+that\s+the\s+session\s+summary\s+is\s+accurate\s+and\s+correct\b",
-                block,
-                re.I,
-            )
-        )
-
-        revision_attestation_present = bool(
-            re.search(
-                r"I\s+attest\s+the\s+revision/edit\s+made\s+to\s+this\s+note\s+as\s+signed\s+below\s+is\s+accurate\s+and\s+true",
-                block,
-                re.I,
-            )
-        )
-
-        outcome_yes = bool(re.search(r"Outcome of Treatment.*?:\s*Yes", block, re.I | re.S))
-
-        sig_valid, sig_cands = any_signature_line_valid(block)
-        provider_signature_present = len(sig_cands) > 0
-        provider_signature_valid = sig_valid
-
-        compliance_errors = []
-
-        if not dob:
-            compliance_errors.append("Missing DOB")
-        if not gender:
-            compliance_errors.append("Missing Gender")
-        if not diagnosis:
-            compliance_errors.append("Missing ICD-10")
-        if diagnosis and len(diagnosis) < 3:
-            compliance_errors.append("Invalid ICD-10 code (truncated)")
-        if not primary_insurance:
-            compliance_errors.append("Missing Primary Insurance")
-        if not insurance_id:
-            compliance_errors.append("Missing Insurance ID")
-
-        # NOTE: time must be normalized successfully; otherwise it is "missing" for compliance
-        if not session_time:
-            compliance_errors.append("Missing Session Time")
-
-        if not session_location:
-            compliance_errors.append("Missing Session Location")
-
-        if not maladaptive_behaviors:
-            compliance_errors.append("No maladaptive behaviors listed")
-
-        if other_selected and not other_maladaptive_present:
-            compliance_errors.append("Other maladaptive behavior selected but no description provided")
-
-        if not data_collected:
-            compliance_errors.append("Missing Session Data")
-        if not session_summary_present:
-            compliance_errors.append("Missing session summary narrative")
-        if not outcome_yes:
-            compliance_errors.append("Outcome of Treatment not Yes")
-
-        if not bt_attestation_present:
-            compliance_errors.append("Missing BT/RBT attestation statement")
-
-        if not provider_signature_present:
-            compliance_errors.append("Missing provider signature section")
-        elif not provider_signature_valid:
-            compliance_errors.append("Provider signature present but invalid format (must include Name, BT/RBT, and date)")
-
-        if not present_client:
-            compliance_errors.append("Attendance: Client not present")
-        if not present_bt:
-            compliance_errors.append("Attendance: BT/RBT not present")
-        if not (present_caregiver or present_sibling):
-            compliance_errors.append("Attendance: Parent/Caregiver or Sibling not present")
-
-        results.append(
-            {
-                "Client": client_name,
-                "Rendering Provider": provider,
-                "Session Date": session_date,
-                "Date of Birth": dob,
-                "Gender": gender,
-                "Diagnosis Code": diagnosis,
-                "Primary Insurance": primary_insurance,
-                "Insurance ID": insurance_id,
-                "Session Time": session_time,
-                "Session Location": session_location,
-                "Present_Client": present_client,
-                "Present_Adult_Caregiver": present_caregiver,
-                "Present_Sibling": present_sibling,
-                "Present_BT_RBT": present_bt,
-                "Maladaptive Behaviors": maladaptive_behaviors,
-                "Other Selected": other_selected,
-                "Other Maladaptive Provided": other_maladaptive_present,
-                "Outcome Yes": outcome_yes,
-                "Data Collected": data_collected,
-                "Session Summary Present": session_summary_present,
-                "BT Attestation Present": bt_attestation_present,
-                "Provider Signature Present": provider_signature_present,
-                "Provider Signature Valid": provider_signature_valid,
-                "Provider Signature Candidates": sig_cands,
-                "Revision Attestation Present": revision_attestation_present,
-                "Compliance Errors": compliance_errors,
-                "PASS": len(compliance_errors) == 0,
-            }
-        )
-
-    return results
-
-
-def notes_to_excel_bytes(results, sheet_name="Notes") -> bytes:
-    df = pd.DataFrame(results)
-    df = excel_sanitize_df(df)
-
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name)
-    output.seek(0)
-    return output.getvalue()
-
-
-# -----------------------------
-# SHARED HELPERS
-# -----------------------------
-def read_any(file):
-    if file is None:
-        return None
-    if file.name.lower().endswith((".csv", ".txt")):
-        return pd.read_csv(file, dtype=str)
-    return pd.read_excel(file, dtype=str, engine="openpyxl")
-
-
-def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [c.strip() for c in df.columns]
-    for c in df.columns:
-        if df[c].dtype == object:
-            df[c] = (
-                df[c]
-                .astype(str)
-                .str.strip()
-                .replace({"nan": np.nan, "": np.nan})
-            )
-    return df
-
-
-def ensure_cols(df: pd.DataFrame, cols, label: str) -> bool:
-    missing = [c for c in cols if c not in df.columns]
-    if missing:
-        st.error(f"**{label}** is missing required columns: {missing}")
-        return False
-    return True
-
-
-def parse_duration_to_minutes(d: Any) -> float:
-    if pd.isna(d):
-        return np.nan
-    s = str(d).strip()
-    if not s or ":" not in s:
-        return np.nan
-    try:
-        parts = [float(x) for x in s.split(":")]
-        if len(parts) == 3:
-            h, m, sec = parts
-            return h * 60 + m + sec / 60
-        elif len(parts) == 2:
-            h, m = parts
-            return h * 60 + m
-    except Exception:
-        return np.nan
-    return np.nan
-
-
-def normalize_client_name_for_match(name: Any) -> str:
-    return normalize_name(name)
-
-
-def export_excel(df: pd.DataFrame) -> bytes:
-    df2 = excel_sanitize_df(df)
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-        df2.to_excel(w, index=False, sheet_name="All")
-    return buf.getvalue()
-
-
-def within_time_tol(sig_ts, base_ts, tol_early_min):
-    if pd.isna(sig_ts) or pd.isna(base_ts):
-        return False
-    diff_min = (sig_ts - base_ts).total_seconds() / 60.0
-    return diff_min > tol_early_min
-
-
-def normalize_name(name: Any) -> str:
-    if pd.isna(name):
-        return ""
-    s = str(name).strip()
-    if not s:
-        return ""
-    parts = s.replace(",", " ").split()
-    parts = [p.capitalize() for p in parts if p]
-    if len(parts) == 1:
-        return parts[0]
-    first = parts[0]
-    last = parts[-1]
-    return f"{last}, {first}"
-
+st.title("Session Compliance Checker")
 
 # -----------------------------
 # SIDEBAR CONTROLS
@@ -516,8 +69,7 @@ with st.sidebar.expander("Duration / Billing Settings", expanded=False):
         min_value=0,
         step=1,
         help=(
-            "If a session's duration is outside the base range "
-            f"({MIN_MINUTES}-{MAX_MINUTES} min) by at most this many minutes, "
+            "If a session's duration is outside the base range by at most this many minutes, "
             "it will still be treated as OK."
         ),
     )
@@ -614,7 +166,6 @@ with tab1:
                 existing_cols = [c for c in cols if c in notes_df.columns]
 
                 ext_df = notes_df[existing_cols].copy()
-
                 ext_df = ext_df.rename(
                     columns={
                         "Present_Adult_Caregiver": "Present_ParentCaregiver",
@@ -622,9 +173,7 @@ with tab1:
                         "Compliance Errors": "Note Compliance Errors",
                     }
                 )
-
                 ext_df = normalize_cols(ext_df)
-
                 ext_df = ext_df[ext_df["Client"].notna()].copy()
 
                 st.session_state["external_sessions_df"] = ext_df
@@ -648,178 +197,6 @@ with tab1:
 # =========================================================
 # TAB 2: SESSION CHECKER
 # =========================================================
-def has_time_adjust_sig(row) -> bool:
-    if TIME_ADJ_COL not in row.index:
-        return False
-    val = row.get(TIME_ADJ_COL)
-    if pd.isna(val):
-        return False
-    s = str(val).strip().lower()
-    return s not in ("", "nan")
-
-
-def duration_ok_base(row) -> bool:
-    m = row.get("Actual Minutes")
-    if pd.isna(m):
-        return False
-    if m < MIN_MINUTES:
-        return False
-    if m <= MAX_MINUTES:
-        return True
-    return (m - MAX_MINUTES) < BILLING_TOL
-
-
-def external_time_ok(row) -> bool:
-    if "Has External Session" not in row.index:
-        return True
-    if not bool(row.get("Has External Session")):
-        return False
-    return (not pd.isna(row.get("_ExtStart_dt"))) and (not pd.isna(row.get("_ExtEnd_dt")))
-
-
-def note_attendance_ok(row) -> bool:
-    client_present = row.get("_Note_ClientPresent")
-    bt_present = row.get("_Note_BTPresent")
-    parent_present = row.get("_Note_ParentPresent")
-    sibling_present = row.get("_Note_SiblingPresent")
-
-    if all(pd.isna(x) for x in [client_present, bt_present, parent_present, sibling_present]):
-        return True
-
-    if not bool(client_present):
-        return False
-    if not bool(bt_present):
-        return False
-    if not (bool(parent_present) or bool(sibling_present)):
-        return False
-    return True
-
-
-def note_parse_ok(row) -> bool:
-    if "Note Parse PASS" not in row.index:
-        return True
-    val = row.get("Note Parse PASS")
-    if pd.isna(val):
-        return False
-    return bool(val)
-
-
-def sig_ok_base(row) -> bool:
-    base_ts = row.get("_End_dt", pd.NaT)
-    parent_sig_ts = row.get("_ParentSig_dt", pd.NaT)
-
-    if pd.isna(parent_sig_ts):
-        return False
-    if pd.isna(base_ts):
-        return False
-
-    if USE_TIME_ADJ_OVERRIDE and has_time_adjust_sig(row):
-        return True
-
-    return within_time_tol(parent_sig_ts, base_ts, SIG_TOL_EARLY)
-
-
-def daily_total_ok(row) -> bool:
-    m = row.get("Daily Minutes")
-    if pd.isna(m):
-        return True
-    return m < (DAILY_MAX_MINUTES + DAILY_TOL)
-
-
-def evaluate_row(row) -> dict:
-    dur_base = duration_ok_base(row)
-    sig_base = sig_ok_base(row)
-    ext_ok = external_time_ok(row)
-    adj_sig = has_time_adjust_sig(row)
-    daily_ok_val = daily_total_ok(row)
-    note_ok_val = note_attendance_ok(row)
-    note_parse_ok_val = note_parse_ok(row)
-
-    duration_ok = dur_base
-    sig_ok = sig_base
-
-    overall = duration_ok and sig_ok and ext_ok and daily_ok_val and note_ok_val and note_parse_ok_val
-
-    return {
-        "duration_ok": duration_ok,
-        "sig_ok": sig_ok,
-        "ext_ok": ext_ok,
-        "daily_ok": daily_ok_val,
-        "note_ok": note_ok_val,
-        "note_parse_ok": note_parse_ok_val,
-        "has_time_adj_sig": adj_sig,
-        "overall_pass": overall,
-        "duration_ok_base": dur_base,
-        "sig_ok_base": sig_base,
-    }
-
-
-def get_failure_reasons(row) -> str:
-    eval_res = evaluate_row(row)
-    reasons = []
-
-    if not eval_res.get("note_parse_ok", True):
-        note_pass = row.get("Note Parse PASS", np.nan)
-        note_errs = row.get("Note Compliance Errors", np.nan)
-
-        if pd.isna(note_pass):
-            reasons.append("No matching session note found in PDF (required)")
-        else:
-            if pd.isna(note_errs) or str(note_errs).strip() == "":
-                reasons.append("Session note failed compliance checks")
-            else:
-                reasons.append(f"Session note failed compliance checks: {note_errs}")
-
-    if not eval_res["ext_ok"]:
-        stime = row.get("Session Time", "")
-        if pd.isna(stime) or str(stime).strip() == "":
-            reasons.append("No Session time on note")
-        else:
-            reasons.append("Session Time invalid: must be same-day and end before 10:00 PM")
-
-    if not eval_res["duration_ok"]:
-        actual_min = row.get("Actual Minutes")
-        if pd.isna(actual_min):
-            reasons.append("Missing Duration data")
-        else:
-            reasons.append(
-                f"Duration ({actual_min:.0f} min) must be between {MIN_MINUTES} and {MAX_MINUTES} minutes"
-            )
-
-    if not eval_res["sig_ok"]:
-        if pd.isna(row.get("_ParentSig_dt", pd.NaT)):
-            reasons.append("Missing Adult Caregiver signature time (required)")
-        else:
-            reasons.append("Parent signature too early.")
-
-    if not eval_res.get("daily_ok", True):
-        daily_min = row.get("Daily Minutes")
-        if not pd.isna(daily_min):
-            reasons.append(
-                f"Total daily duration for this BT on {row.get('Date')} "
-                f"({daily_min:.0f} min) exceeded"
-            )
-
-    if not eval_res.get("note_ok", True):
-        missing = []
-
-        client_ok = bool(row.get("_Note_ClientPresent"))
-        bt_ok = bool(row.get("_Note_BTPresent"))
-        parent_ok = bool(row.get("_Note_ParentPresent"))
-        sibling_ok = bool(row.get("_Note_SiblingPresent"))
-
-        if not client_ok:
-            missing.append("Client")
-        if not bt_ok:
-            missing.append("BT/RBT")
-        if not (parent_ok or sibling_ok):
-            missing.append("Parent/Caregiver or Sibling")
-
-        reasons.append("Session note attendance issue: missing " + ", ".join(missing))
-
-    return "; ".join(reasons) if reasons else "PASS"
-
-
 with tab2:
     st.header("Session Checker")
 
@@ -856,6 +233,14 @@ with tab2:
         value=True,
     )
 
+    # Inject runtime settings into validators module
+    configure_validators(
+        billing_tol=BILLING_TOL,
+        daily_tol=DAILY_TOL,
+        sig_tol_early=SIG_TOL_EARLY,
+        use_time_adj_override=USE_TIME_ADJ_OVERRIDE,
+    )
+
     df = pd.read_excel(sessions_file, dtype=object)
     df = normalize_cols(df)
 
@@ -875,7 +260,6 @@ with tab2:
     ].copy()
 
     df_f["_RowOrder"] = np.arange(len(df_f))
-
     df_f["Actual Minutes"] = df_f["Duration"].apply(parse_duration_to_minutes)
 
     start_raw = df_f["Start date"].astype(str).str.strip()
@@ -888,7 +272,7 @@ with tab2:
     df_f["Staff Name"] = df_f["User"].apply(normalize_client_name_for_match)
     df_f["Client Name"] = df_f["Client"].apply(normalize_client_name_for_match)
 
-    # ---- Matching unchanged ----
+    # ---- External session matching ----
     if external_sessions_df is not None:
         ext_df = normalize_cols(external_sessions_df.copy())
 
@@ -932,13 +316,11 @@ with tab2:
                 else:
                     df_f[dst] = np.nan
 
-            # ✅ Single authoritative normalization (no fallback keeping raw)
             if "Session Time" in df_f.columns:
                 df_f["Session Time"] = df_f["Session Time"].apply(
-            lambda v: v if isinstance(v, str) and ("AM" in v or "PM" in v)
-            else normalize_session_time(v)
-        )
-
+                    lambda v: v if isinstance(v, str) and ("AM" in v or "PM" in v)
+                    else normalize_session_time(v)
+                )
 
             df_f["Has External Session"] = (
                 df_f.get("Session Time", pd.Series([np.nan] * len(df_f))).notna()
@@ -966,7 +348,7 @@ with tab2:
         else:
             st.warning("External sessions data provided, but required columns are missing.")
 
-    # ---- BT contacts unchanged ----
+    # ---- BT contacts ----
     df_f["Phone"] = ""
     df_f["Email"] = ""
 
@@ -1015,6 +397,30 @@ with tab2:
                 df_f["Email"] = df_f["Staff Name"].map(staff_to_email).fillna("")
 
     df_f["Daily Minutes"] = df_f.groupby(["Staff Name", "Date"])["Actual Minutes"].transform("sum")
+    df_f["Daily Session Count"] = df_f.groupby(["Client Name", "Date", "Session"])["Session"].transform("count")
+
+    # ---- Gap tracking columns (kept for data, check disabled) ----
+    df_f["_SessionGapOk"] = True
+    df_f["_SessionGapMinutes"] = np.nan
+
+    if "_ExtStart_dt" in df_f.columns and "_ExtEnd_dt" in df_f.columns:
+        for (client, date), grp in df_f.groupby(["Client Name", "Date"], sort=False):
+            if len(grp) < 2:
+                continue
+            grp_sorted = grp.dropna(subset=["_ExtStart_dt", "_ExtEnd_dt"]).sort_values("_ExtStart_dt")
+            if len(grp_sorted) < 2:
+                continue
+            idx_list = list(grp_sorted.index)
+            for i in range(len(idx_list) - 1):
+                a_end = df_f.at[idx_list[i], "_ExtEnd_dt"]
+                b_start = df_f.at[idx_list[i + 1], "_ExtStart_dt"]
+                gap_minutes = (b_start - a_end).total_seconds() / 60.0
+                for idx in [idx_list[i], idx_list[i + 1]]:
+                    existing = df_f.at[idx, "_SessionGapMinutes"]
+                    if pd.isna(existing) or gap_minutes < existing:
+                        df_f.at[idx, "_SessionGapMinutes"] = gap_minutes
+                    if gap_minutes < MIN_SESSION_GAP_MINUTES:
+                        df_f.at[idx, "_SessionGapOk"] = False
 
     eval_results = df_f.apply(evaluate_row, axis=1, result_type="expand")
     df_f["_DurationOk"] = eval_results["duration_ok"]
@@ -1024,6 +430,7 @@ with tab2:
     df_f["_HasTimeAdjSig"] = eval_results["has_time_adj_sig"]
     df_f["_NoteOk"] = eval_results["note_ok"]
     df_f["_NoteParseOk"] = eval_results["note_parse_ok"]
+    df_f["_GapOk"] = eval_results["gap_ok"]
     df_f["_OverallPass"] = eval_results["overall_pass"]
 
     df_f["Failure Reasons"] = df_f.apply(get_failure_reasons, axis=1)
@@ -1046,19 +453,15 @@ with tab2:
         "Duration",
         "Actual Minutes",
         "Daily Minutes",
+        "Daily Session Count",
         "Adult Caregiver signature time",
         "Session Time",
         "Note Compliance Errors",
     ]
-
     if TIME_ADJ_COL in df_f.columns:
         display_cols.append(TIME_ADJ_COL)
 
-    display_cols.extend(
-        [
-            "Failure Reasons",
-        ]
-    )
+    display_cols.append("Failure Reasons")
 
     present_cols = [c for c in display_cols if c in df_f.columns]
 
@@ -1098,7 +501,7 @@ with tab2:
 
 
 # =========================================================
-# TAB 3 (unchanged)
+# TAB 3: BILLED CHECKER
 # =========================================================
 with tab3:
     st.header("Billed Checker – Billed / Unbilled / No Match")
@@ -1116,7 +519,7 @@ with tab3:
 
         billing_file = st.file_uploader(
             "Upload Aloha file with billed & unbilled sessions "
-            "(must include 'Appointment ID' and 'Date Billed')",
+            "(must include 'Appointment ID', 'Date Billed', and 'Completed')",
             type=["xlsx", "xls", "csv"],
             key="billing_status_file",
         )
@@ -1131,8 +534,8 @@ with tab3:
             if billing_df is not None:
                 billing_df = normalize_cols(billing_df)
 
-                if "Appointment ID" not in billing_df.columns or "Date Billed" not in billing_df.columns:
-                    st.error("Billing status file must contain columns: 'Appointment ID' and 'Date Billed'.")
+                if not all(c in billing_df.columns for c in ["Appointment ID", "Date Billed", "Completed"]):
+                    st.error("Billing status file must contain columns: 'Appointment ID', 'Date Billed', and 'Completed'.")
                 elif "AlohaABA Appointment ID" not in base_df.columns:
                     st.error(
                         "Session Checker data is missing 'AlohaABA Appointment ID'. "
@@ -1140,7 +543,7 @@ with tab3:
                     )
                 else:
                     merged = base_df.merge(
-                        billing_df[["Appointment ID", "Date Billed"]],
+                        billing_df[["Appointment ID", "Date Billed", "Completed"]],
                         left_on="AlohaABA Appointment ID",
                         right_on="Appointment ID",
                         how="left",
@@ -1153,12 +556,26 @@ with tab3:
 
                         if app_id == "" or app_id.lower() == "nan":
                             return "No Match"
-
                         if date_billed != "" and date_billed.lower() != "nan":
                             return "Billed"
                         return "Unbilled"
 
                     merged["Billing Status"] = merged.apply(classify_status, axis=1)
+
+                    # Flag passed sessions where Aloha shows not completed
+                    not_completed_mask = (
+                        merged["_OverallPass"] == True
+                    ) & (
+                        merged["Billing Status"] != "No Match"
+                    ) & (
+                        merged["Completed"].astype(str).str.strip().str.lower() != "yes"
+                    )
+
+                    merged.loc[not_completed_mask, "Failure Reasons"] = (
+                        merged.loc[not_completed_mask, "Failure Reasons"]
+                        .apply(lambda x: "Authorization Exceeded" if x == "PASS" else x + "; Authorization Exceeded")
+                    )
+                    merged.loc[not_completed_mask, "_OverallPass"] = False
 
                     all_df = merged.copy()
                     billed_df = merged[merged["Billing Status"] == "Billed"]
@@ -1200,17 +617,11 @@ with tab3:
                         if c in merged.columns
                     ]
 
-                    all_dl = all_df[dl_cols]
-                    billed_dl = billed_df[dl_cols]
-                    unbilled_clean_dl = unbilled_clean_df[dl_cols]
-                    unbilled_flagged_dl = unbilled_flagged_df[dl_cols]
-                    nomatch_dl = nomatch_df[dl_cols]
-
-                    xlsx_all = export_excel(all_dl)
-                    xlsx_billed = export_excel(billed_dl)
-                    xlsx_unbilled_clean = export_excel(unbilled_clean_dl)
-                    xlsx_unbilled_flagged = export_excel(unbilled_flagged_dl)
-                    xlsx_nomatch = export_excel(nomatch_dl)
+                    xlsx_all = export_excel(all_df[dl_cols])
+                    xlsx_billed = export_excel(billed_df[dl_cols])
+                    xlsx_unbilled_clean = export_excel(unbilled_clean_df[dl_cols])
+                    xlsx_unbilled_flagged = export_excel(unbilled_flagged_df[dl_cols])
+                    xlsx_nomatch = export_excel(nomatch_df[dl_cols])
 
                     c1, c2, c3, c4, c5 = st.columns(5)
                     with c1:

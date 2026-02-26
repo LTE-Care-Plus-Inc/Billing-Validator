@@ -1,8 +1,191 @@
+# ===========================
+# utils.py
+# ===========================
+import io
 import re
 import unicodedata
-from typing import Any, Tuple
+from typing import Any
 
+import numpy as np
 import pandas as pd
+import streamlit as st
+
+
+# =========================================================
+# Excel-safe sanitizer
+# =========================================================
+_ILLEGAL_XL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+
+def excel_safe_str(v: Any) -> Any:
+    if v is None:
+        return v
+    if isinstance(v, float) and pd.isna(v):
+        return v
+    s = str(v)
+    s = _ILLEGAL_XL_CHARS_RE.sub("", s)
+    return s
+
+
+def excel_sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
+    df2 = df.copy()
+    for c in df2.columns:
+        if df2[c].dtype == object:
+            df2[c] = df2[c].map(excel_safe_str)
+    return df2
+
+
+def export_excel(df: pd.DataFrame) -> bytes:
+    df2 = excel_sanitize_df(df)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+        df2.to_excel(w, index=False, sheet_name="All")
+    return buf.getvalue()
+
+
+# =========================================================
+# File reading
+# =========================================================
+def read_any(file):
+    if file is None:
+        return None
+    if file.name.lower().endswith((".csv", ".txt")):
+        return pd.read_csv(file, dtype=str)
+    return pd.read_excel(file, dtype=str, engine="openpyxl")
+
+
+# =========================================================
+# DataFrame helpers
+# =========================================================
+def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.strip() for c in df.columns]
+    for c in df.columns:
+        if df[c].dtype == object:
+            df[c] = (
+                df[c]
+                .astype(str)
+                .str.strip()
+                .replace({"nan": np.nan, "": np.nan})
+            )
+    return df
+
+
+def ensure_cols(df: pd.DataFrame, cols, label: str) -> bool:
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        st.error(f"**{label}** is missing required columns: {missing}")
+        return False
+    return True
+
+
+# =========================================================
+# Duration parsing
+# =========================================================
+def parse_duration_to_minutes(d: Any) -> float:
+    if pd.isna(d):
+        return np.nan
+    s = str(d).strip()
+    if not s or ":" not in s:
+        return np.nan
+    try:
+        parts = [float(x) for x in s.split(":")]
+        if len(parts) == 3:
+            h, m, sec = parts
+            return h * 60 + m + sec / 60
+        elif len(parts) == 2:
+            h, m = parts
+            return h * 60 + m
+    except Exception:
+        return np.nan
+    return np.nan
+
+
+# =========================================================
+# Name normalization
+# =========================================================
+def normalize_name(name: Any) -> str:
+    if pd.isna(name):
+        return ""
+    s = str(name).strip()
+    if not s:
+        return ""
+    parts = s.replace(",", " ").split()
+    parts = [p.capitalize() for p in parts if p]
+    if len(parts) == 1:
+        return parts[0]
+    first = parts[0]
+    last = parts[-1]
+    return f"{last}, {first}"
+
+
+def normalize_client_name_for_match(name: Any) -> str:
+    return normalize_name(name)
+
+
+# =========================================================
+# Time helpers
+# =========================================================
+def within_time_tol(sig_ts, base_ts, tol_early_min):
+    if pd.isna(sig_ts) or pd.isna(base_ts):
+        return False
+    diff_min = (sig_ts - base_ts).total_seconds() / 60.0
+    return diff_min > tol_early_min
+
+
+# =========================================================
+# Time normalization (kept here for backwards compatibility)
+# =========================================================
+def strip_private_use(s: str) -> str:
+    """Remove private-use unicode chars and replacement char."""
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.replace("\ufffd", "")
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Co")
+
+
+def clean_time_text(s: str) -> str:
+    if not s:
+        return ""
+
+    s = str(s)
+
+    # Step 1: infer AM/PM from corrupted markers BEFORE stripping
+    def _infer_ampm(m):
+        rest = s[m.end():]
+        hour_match = re.match(r"\s*(\d{1,2})\s*:", rest)
+        if not hour_match:
+            return ""
+        h = int(hour_match.group(1))
+        if h == 12 or 1 <= h <= 7:
+            return "pm "
+        return "am "
+
+    s = re.sub(r"\ufffd+", _infer_ampm, s)
+
+    # Step 2: now safe to strip remaining junk
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\u00a0", " ")
+
+    # Chinese markers (if intact)
+    s = s.replace("上午", "am ").replace("下午", "pm ")
+
+    # unify dash variants
+    s = s.replace("–", "-").replace("—", "-").replace("−", "-")
+
+    # normalize AM/PM variants
+    s = s.lower()
+    s = s.replace("a.m.", "am").replace("p.m.", "pm")
+    s = s.replace("a. m.", "am").replace("p. m.", "pm")
+
+    # standardize spacing around hyphen
+    s = re.sub(r"\s*-\s*", " - ", s)
+
+    # collapse whitespace
+    s = " ".join(s.split()).strip()
+    return s
+
 
 _TIME_RANGE_RE = re.compile(
     r"(?:(?P<s_ampm1>am|pm)\s*)?"
@@ -15,62 +198,13 @@ _TIME_RANGE_RE = re.compile(
     re.I,
 )
 
-def strip_private_use(s: str) -> str:
-    """Remove private-use unicode chars and replacement char."""
-    if s is None:
-        return ""
-    s = str(s)
-    s = s.replace("\ufffd", "")
-    return "".join(ch for ch in s if unicodedata.category(ch) != "Co")
-
-
-def clean_time_text(s: str) -> str:
-    """
-    Normalize extracted time text into something parse-friendly:
-    - NFKC normalize
-    - Chinese 上午/下午 -> am/pm
-    - unify dash variants
-    - standardize spacing around '-'
-    - normalize a.m./p.m. variants
-    """
-    if not s:
-        return ""
-
-    s = strip_private_use(s)
-
-    # normalize unicode width and punctuation
-    s = unicodedata.normalize("NFKC", s)
-    s = s.replace("\u00a0", " ")
-
-    # Chinese markers -> am/pm
-    s = s.replace("上午", "am").replace("下午", "pm")
-
-    # unify dash variants
-    s = s.replace("–", "-").replace("—", "-").replace("−", "-")
-
-    # normalize AM/PM variants and case
-    s_low = s.lower()
-    s_low = s_low.replace("a.m.", "am").replace("p.m.", "pm")
-    s_low = s_low.replace("a. m.", "am").replace("p. m.", "pm")
-    s = s_low
-
-    # standardize spacing around hyphen
-    s = re.sub(r"\s*-\s*", " - ", s)
-
-    # collapse whitespace
-    s = " ".join(s.split()).strip()
-    return s
-
 
 def normalize_time_range(raw):
-    # If already canonical, never reinterpret
     if isinstance(raw, str) and re.search(
         r"\b\d{1,2}:\d{2}\s*(AM|PM)\s*-\s*\d{1,2}:\d{2}\s*(AM|PM)\b",
         raw
     ):
         return raw.strip()
-
-
 
     if raw is None or (isinstance(raw, float) and pd.isna(raw)):
         return ""
@@ -91,7 +225,6 @@ def normalize_time_range(raw):
     if sm > 59 or em > 59 or sh > 23 or eh > 23:
         return ""
 
-    # ✅ ONLY these groups exist now
     s_ampm = (m.group("s_ampm1") or m.group("s_ampm2") or "").lower()
     e_ampm = (m.group("e_ampm1") or m.group("e_ampm2") or "").lower()
 
@@ -103,17 +236,16 @@ def normalize_time_range(raw):
         h12 = h % 12 or 12
         return h12, ap
 
-    # ---- Rule 1: explicit 24-hour ----
     if sh >= 13 or eh >= 13:
         sh12, sap = from_24h(sh)
         eh12, eap = from_24h(eh)
         return f"{fmt(sh12, sm, sap)} - {fmt(eh12, em, eap)}"
 
-    # ---- Rule 2: explicit AM + PM on both sides ----
     if s_ampm and e_ampm:
-        return f"{fmt(sh, sm, s_ampm.upper())} - {fmt(eh, em, e_ampm.upper())}"
+        sh_out = sh if sh != 0 else 12
+        eh_out = eh if eh != 0 else 12
+        return f"{fmt(sh_out, sm, s_ampm.upper())} - {fmt(eh_out, em, e_ampm.upper())}"
 
-    # ---- Rule 3: propagate single-sided AM/PM ----
     if s_ampm and not e_ampm:
         e_ampm = s_ampm
     if e_ampm and not s_ampm:
@@ -121,21 +253,14 @@ def normalize_time_range(raw):
 
     if s_ampm and e_ampm:
         return f"{fmt(sh, sm, s_ampm.upper())} - {fmt(eh, em, e_ampm.upper())}"
-    # ---- Rule 3.5: corrupted Chinese AM/PM inference (�� / �) ----
+
     raw_s = "" if raw is None else str(raw)
-    if ("\ufffd" in raw_s) or ("��" in raw_s) or ("�" in raw_s):
-        # If end hour < start hour, treat as morning -> afternoon
-        # e.g. 9:00 - 3:00  => 9:00 AM - 3:00 PM
+    if ("\ufffd" in raw_s) or ("��" in raw_s) or ("" in raw_s):
         if eh < sh:
             return f"{fmt(sh, sm, 'AM')} - {fmt(eh, em, 'PM')}"
-
-        # Otherwise assume afternoon block for typical ABA ranges
-        # e.g. 2:30 - 6:00  => 2:30 PM - 6:00 PM
-        # Keep 11-12 edge safe: 11-12 could be AM, but most BT sessions are PM; adjust if needed.
         if 1 <= sh <= 7 and 3 <= eh <= 10:
             return f"{fmt(sh, sm, 'PM')} - {fmt(eh, em, 'PM')}"
 
-    # ---- Rule 4: ONLY if no AM/PM tokens existed in original string ----
     if "am" not in s and "pm" not in s:
         sh12, sap = from_24h(sh)
         eh12, eap = from_24h(eh)
@@ -144,34 +269,15 @@ def normalize_time_range(raw):
     return ""
 
 
-
-
 def normalize_session_time(raw: str) -> str:
-    """
-    Backwards-compatible wrapper.
-    Previously your app called normalize_session_time(raw) during merge.
-    Now it uses the SINGLE authoritative normalization.
-    """
     return normalize_time_range(raw)
 
 
 def extract_first_time_range(raw: str) -> str:
-    """
-    Backwards-compatible wrapper.
-    Previously PDF parser called extract_first_time_range(raw_session_time).
-    Now it uses the SINGLE authoritative normalization.
-    """
     return normalize_time_range(raw)
 
 
 def parse_session_time_range(session_time: Any, base_date: Any):
-    """
-    Business rules:
-    - Same-day sessions only
-    - No overnight sessions
-    - Hard cutoff: end must be before 10:08 PM
-    NOTE: This function assumes session_time is already canonical or empty.
-    """
     if session_time is None or (isinstance(session_time, float) and pd.isna(session_time)):
         return pd.NaT, pd.NaT
 
@@ -190,11 +296,9 @@ def parse_session_time_range(session_time: Any, base_date: Any):
     if pd.isna(start_dt) or pd.isna(end_dt):
         return pd.NaT, pd.NaT
 
-    # No overnight sessions allowed
     if end_dt <= start_dt:
         return pd.NaT, pd.NaT
 
-    # Hard cutoff: before 10:08 PM
     if end_dt.hour > 22 or (end_dt.hour == 22 and end_dt.minute >= 8):
         return pd.NaT, pd.NaT
 
@@ -202,15 +306,6 @@ def parse_session_time_range(session_time: Any, base_date: Any):
 
 
 def normalize_date(raw: str) -> str:
-    """
-    Normalize dates to MM/DD/YYYY.
-
-    Supported:
-    - DD.MM.YYYY
-    - DD/MM/YYYY (if day > 12)
-    - MM/DD/YYYY
-    - YYYY-MM-DD, YYYY/MM/DD
-    """
     if raw is None:
         return ""
 
@@ -218,19 +313,16 @@ def normalize_date(raw: str) -> str:
     if not raw:
         return ""
 
-    # ISO formats: YYYY-MM-DD or YYYY/MM/DD
     m_iso = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$", raw)
     if m_iso:
         y, m, d = map(int, m_iso.groups())
         return f"{m:02d}/{d:02d}/{y:04d}"
 
-    # European dotted: DD.MM.YYYY
     m_dot = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$", raw)
     if m_dot:
         d, m, y = map(int, m_dot.groups())
         return f"{m:02d}/{d:02d}/{y:04d}"
 
-    # Slash: MM/DD/YYYY or DD/MM/YYYY
     m_slash = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", raw)
     if m_slash:
         p1, p2, y = map(int, m_slash.groups())
