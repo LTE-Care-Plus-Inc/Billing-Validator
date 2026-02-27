@@ -10,7 +10,7 @@ MAX_MINUTES = 360
 BILLING_TOL_DEFAULT = 8
 DAILY_MAX_MINUTES = 480
 
-TIME_ADJ_COL = "Adult Caregiver's Signature Approval for Time Adjustment signature"
+TIME_ADJ_COL = "Adult Caregiver’s Signature Approval for Time Adjustment signature"
 
 REQ_COLS = [
     "Status",
