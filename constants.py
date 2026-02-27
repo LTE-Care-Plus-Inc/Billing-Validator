@@ -25,6 +25,4 @@ REQ_COLS = [
 
 DATE_RE = r"(\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2}|\d{1,2}[-/\.]\d{1,2}[-/\.]\d{4})"
 
-# Minimum gap (in minutes) required between two sessions for the same client on the same day
-# Set to 0 to disable
-MIN_SESSION_GAP_MINUTES = 0
+MIN_SESSION_GAP_MINUTES = 30

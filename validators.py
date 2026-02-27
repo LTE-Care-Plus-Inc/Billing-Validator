@@ -120,7 +120,10 @@ def evaluate_row(row) -> dict:
     note_parse_ok_val = note_parse_ok(row)
 
     # Gap check disabled
-    gap_ok_val = True
+    gap_ok_val = row.get("_SessionGapOk", True)
+    if pd.isna(gap_ok_val):
+        gap_ok_val = True
+    gap_ok_val = bool(gap_ok_val)
 
     duration_ok = dur_base
     sig_ok = sig_base
@@ -196,6 +199,16 @@ def get_failure_reasons(row) -> str:
                 f"({daily_min:.0f} min) exceeded"
             )
 
+    if not eval_res.get("gap_ok", True):
+        gap_min = row.get("_SessionGapMinutes")
+        if pd.isna(gap_min) or gap_min < 0:
+            reasons.append("Same-day sessions overlap for this client")
+        else:
+            reasons.append(
+                f"Same-day sessions for this client are only {gap_min:.0f} min apart "
+                f"(minimum {MIN_SESSION_GAP_MINUTES} min required)"
+            )
+            
     if not eval_res.get("note_ok", True):
         missing = []
 

@@ -338,12 +338,20 @@ with tab2:
                 & df_f["_ExtEnd_dt"].notna()
             )
 
-            df_f.loc[has_ext_valid, "Actual Minutes"] = (
+            df_f["Note Minutes"] = np.nan
+            df_f.loc[has_ext_valid, "Note Minutes"] = (
                 (df_f.loc[has_ext_valid, "_ExtEnd_dt"] - df_f.loc[has_ext_valid, "_ExtStart_dt"])
                 .dt.total_seconds()
                 / 60.0
             )
             df_f.loc[has_ext_valid, "_End_dt"] = df_f.loc[has_ext_valid, "_ExtEnd_dt"]
+
+            # Duration Match: True if within 1 minute
+            df_f["Duration Match"] = (
+                df_f["Actual Minutes"].notna()
+                & df_f["Note Minutes"].notna()
+                & ((df_f["Actual Minutes"] - df_f["Note Minutes"]).abs() <= 1)
+            )
 
         else:
             st.warning("External sessions data provided, but required columns are missing.")
@@ -454,6 +462,7 @@ with tab2:
         "Actual Minutes",
         "Daily Minutes",
         "Daily Session Count",
+        "Duration Match",
         "Adult Caregiver signature time",
         "Session Time",
         "Note Compliance Errors",
