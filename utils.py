@@ -151,18 +151,8 @@ def clean_time_text(s: str) -> str:
 
     s = str(s)
 
-    # Step 1: infer AM/PM from corrupted markers BEFORE stripping
-    def _infer_ampm(m):
-        rest = s[m.end():]
-        hour_match = re.match(r"\s*(\d{1,2})\s*:", rest)
-        if not hour_match:
-            return ""
-        h = int(hour_match.group(1))
-        if h == 12 or 1 <= h <= 7:
-            return "pm "
-        return "am "
-
-    s = re.sub(r"\ufffd+", _infer_ampm, s)
+    # Strip corrupted markers — AM/PM will be resolved later using context
+    s = re.sub(r"\ufffd+", " ", s).strip()
 
     # Step 2: now safe to strip remaining junk
     s = unicodedata.normalize("NFKC", s)
@@ -255,13 +245,24 @@ def normalize_time_range(raw):
         return f"{fmt(sh, sm, s_ampm.upper())} - {fmt(eh, em, e_ampm.upper())}"
 
     raw_s = "" if raw is None else str(raw)
-    if ("\ufffd" in raw_s) or ("��" in raw_s) or ("" in raw_s):
-        if eh < sh:
+    has_corruption = ("\ufffd" in raw_s) or ("��" in raw_s) or ("\ue000" in raw_s)
+    if has_corruption:
+    # Unambiguous: cross noon (end < start means AM → PM)
+        if eh < sh and sh >= 6:
             return f"{fmt(sh, sm, 'AM')} - {fmt(eh, em, 'PM')}"
-        if 1 <= sh <= 7 and 3 <= eh <= 10:
-            return f"{fmt(sh, sm, 'PM')} - {fmt(eh, em, 'PM')}"
+        # Unambiguous: must be PM (before 6am minimum)
+        if sh <= 5:
+            sh12 = sh % 12 or 12
+            eh12 = eh % 12 or 12
+            return f"{fmt(sh12, sm, 'PM')} - {fmt(eh12, em, 'PM')}"
+        # Unambiguous: end hits noon or beyond
+        if eh == 12:
+            return f"{fmt(sh, sm, 'AM')} - {fmt(12, em, 'PM')}"
+        # Ambiguous: flag for signature resolver in Tab 2
+        return f"{fmt(sh, sm, 'AM')} - {fmt(eh, em, 'AM')}  ⚠️ AM/PM unknown"
 
     if "am" not in s and "pm" not in s:
+        # No AM/PM markers and no corruption — treat as 24h format
         sh12, sap = from_24h(sh)
         eh12, eap = from_24h(eh)
         return f"{fmt(sh12, sm, sap)} - {fmt(eh12, em, eap)}"

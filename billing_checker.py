@@ -156,6 +156,7 @@ with tab1:
                     "Client",
                     "Session Time",
                     "Session Date",
+                    "Insurance ID",
                     "Present_Client",
                     "Present_Adult_Caregiver",
                     "Present_Sibling",
@@ -276,14 +277,18 @@ with tab2:
     if external_sessions_df is not None:
         ext_df = normalize_cols(external_sessions_df.copy())
 
-        if ensure_cols(ext_df, ["Client", "Session Time"], "External Sessions File"):
+        if ensure_cols(ext_df, ["Insurance ID", "Session Time"], "External Sessions File"):
             ext_df["Client Name"] = ext_df["Client"].apply(normalize_client_name_for_match)
 
-            ext_df["SessionIndex"] = ext_df.groupby("Client Name").cumcount()
-            df_f["SessionIndex"] = df_f.groupby("Client Name").cumcount()
+            # FIX: Rename ext_df "Insurance ID" → "Client: Insurance ID" so both
+            # dataframes share the same column name before grouping and merging.
+            ext_df = ext_df.rename(columns={"Insurance ID": "Client: Insurance ID"})
+
+            ext_df["SessionIndex"] = ext_df.groupby("Client: Insurance ID").cumcount()
+            df_f["SessionIndex"] = df_f.groupby("Client: Insurance ID").cumcount()
 
             merge_cols = [
-                "Client Name",
+                "Client: Insurance ID",
                 "SessionIndex",
                 "Session Time",
                 "Session Date",
@@ -298,12 +303,34 @@ with tab2:
 
             df_f = df_f.merge(
                 ext_df[merge_cols],
-                on=["Client Name", "SessionIndex"],
+                on=["Client: Insurance ID", "SessionIndex"],
                 how="left",
                 sort=False,
             )
 
             df_f = df_f.sort_values("_RowOrder", kind="mergesort").reset_index(drop=True)
+
+                        # ---- MERGE DEBUGGING ----
+            with st.expander("🔍 Merge Debug", expanded=True):
+                total = len(df_f)
+                matched = df_f["Session Time"].notna().sum()
+                unmatched = total - matched
+                st.write(f"**Total rows:** {total} | **Matched (got Session Time):** {matched} | **Unmatched:** {unmatched}")
+
+                st.write("**ext_df Insurance IDs (sample):**", ext_df["Client: Insurance ID"].dropna().unique()[:10].tolist())
+                st.write("**df_f Insurance IDs (sample):**", df_f["Client: Insurance ID"].dropna().unique()[:10].tolist())
+
+                st.write("**SessionIndex range in ext_df:**", ext_df["SessionIndex"].min(), "–", ext_df["SessionIndex"].max())
+                st.write("**SessionIndex range in df_f:**", df_f["SessionIndex"].min(), "–", df_f["SessionIndex"].max())
+
+                unmatched_df = df_f[df_f["Session Time"].isna()][["Client Name", "Client: Insurance ID", "SessionIndex", "Date"]].head(20)
+                st.write("**Unmatched rows (first 20):**")
+                st.dataframe(unmatched_df, use_container_width=True)
+
+                matched_df = df_f[df_f["Session Time"].notna()][["Client Name", "Client: Insurance ID", "SessionIndex", "Date", "Session Time"]].head(20)
+                st.write("**Matched rows (first 20):**")
+                st.dataframe(matched_df, use_container_width=True)
+            # ---- END MERGE DEBUGGING ----
 
             for src, dst in [
                 ("Present_Client", "_Note_ClientPresent"),
@@ -321,6 +348,27 @@ with tab2:
                     lambda v: v if isinstance(v, str) and ("AM" in v or "PM" in v)
                     else normalize_session_time(v)
                 )
+
+                # ---- Resolve ambiguous AM/PM using signature time ----
+                ambiguous_mask = df_f["Session Time"].astype(str).str.contains("⚠️", na=False)
+
+                if ambiguous_mask.any():
+                    def resolve_with_sig(row):
+                        time_str = str(row["Session Time"])
+                        clean = time_str.replace("  ⚠️ AM/PM unknown", "").strip()
+                        sig_dt = row.get("_ParentSig_dt")
+                        if pd.notna(sig_dt):
+                            # Signature in PM → flip to PM
+                            if sig_dt.hour >= 12:
+                                return clean.replace("AM", "PM")
+                            # Signature in AM → keep AM
+                            return clean
+                        # No signature → keep ⚠️ flag for manual review
+                        return time_str
+
+                    df_f.loc[ambiguous_mask, "Session Time"] = df_f[ambiguous_mask].apply(
+                        resolve_with_sig, axis=1
+                    )
 
             df_f["Has External Session"] = (
                 df_f.get("Session Time", pd.Series([np.nan] * len(df_f))).notna()
@@ -460,6 +508,7 @@ with tab2:
         "Email",
         "Duration",
         "Actual Minutes",
+        "Notes Minutes",
         "Daily Minutes",
         "Daily Session Count",
         "Duration Match",
@@ -474,24 +523,27 @@ with tab2:
 
     present_cols = [c for c in display_cols if c in df_f.columns]
 
+    # Filter demo/marry FIRST before any display or export
+    if "Client Name" in df_f.columns:
+        demo_mask = df_f["Client Name"].astype(str).str.lower().str.contains("demo|marry", na=False)
+        export_df = df_f[~demo_mask].copy()
+    else:
+        export_df = df_f.copy()
+
     st.subheader("2) Results")
     with st.expander("Summary", expanded=False):
-        st.dataframe(df_f[present_cols], use_container_width=True, height=560)
+        st.dataframe(export_df[present_cols], use_container_width=True, height=560)
 
     st.caption("Summary")
     summary = pd.DataFrame(
         {
-            "Total (after filters)": [len(df_f)],
-            "Pass": [int(df_f["_OverallPass"].sum())],
-            "Fail": [int((~df_f["_OverallPass"]).sum())],
+            "Total (after filters)": [len(export_df)],
+            "Pass": [int(export_df["_OverallPass"].sum())],
+            "Fail": [int((~export_df["_OverallPass"]).sum())],
         }
     )
     st.table(summary)
 
-    if "Client Name" in df_f.columns:
-        export_df = df_f[df_f["Client Name"] != "Marry Wang Demo"].copy()
-    else:
-        export_df = df_f.copy()
 
     st.session_state["session_checker_df"] = export_df.copy()
     st.session_state["session_checker_present_cols"] = present_cols
@@ -506,7 +558,7 @@ with tab2:
     with c2:
         st.download_button("✅ Passed Only", data=xlsx_clean, file_name="clean_sessions.xlsx")
     with c3:
-        st.download_button("⚠️ Failed Only", data=xlsx_flagged, file_name="flagged_sessions.xlsx")
+        st.download_button("⬇️ Failed Only", data=xlsx_flagged, file_name="flagged_sessions.xlsx")
 
 
 # =========================================================
@@ -558,6 +610,9 @@ with tab3:
                         how="left",
                         sort=False,
                     )
+
+                    demo_mask = merged["Client Name"].astype(str).str.lower().str.contains("demo|marry", na=False)
+                    merged = merged[~demo_mask].copy()
 
                     def classify_status(row):
                         app_id = str(row.get("Appointment ID", "")).strip()
