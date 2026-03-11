@@ -159,7 +159,7 @@ def parse_notes(text: str):
 
         session_time = normalize_time_range(raw_session_time)
 
-        location_match = re.search(r"Session Location\s*:\s*([^\n]+)", block)
+        location_match = re.search(r"Session Location[ \t]*:[ \t]*([^\r\n]*)", block)
         session_location = location_match.group(1).strip() if location_match else ""
 
         present_text = ""

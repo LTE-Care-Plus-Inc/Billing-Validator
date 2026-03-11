@@ -2,7 +2,7 @@
 # constants.py
 # ===========================
 
-STATUS_REQUIRED = "Transferred to AlohaABA"
+STATUS_REQUIRED = {"Transferred to AlohaABA", "Completed"}
 SESSION_REQUIRED = "1:1 BT Direct Service"
 
 MIN_MINUTES = 53

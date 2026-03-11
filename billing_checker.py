@@ -88,6 +88,14 @@ bt_contacts_file = st.sidebar.file_uploader(
     key="bt_contacts",
 )
 
+st.sidebar.header("Zoho CRM (optional)")
+zoho_file = st.sidebar.file_uploader(
+    "Upload Zoho Export (for Case Coordinator Name)",
+    type=["csv", "xlsx"],
+    key="zoho_file",
+    help="Must contain 'Medicaid ID', 'Date of Birth', and 'Case Coordinator Name' columns.",
+)
+
 with st.expander("Instructions", expanded=False):
     st.markdown(
         """
@@ -256,7 +264,7 @@ with tab2:
             st.stop()
 
     df_f = df[
-        (df["Status"].astype(str).str.strip() == STATUS_REQUIRED)
+        (df["Status"].astype(str).str.strip().isin(STATUS_REQUIRED))
         & (df["Session"].astype(str).str.strip() == SESSION_REQUIRED)
     ].copy()
 
@@ -452,6 +460,63 @@ with tab2:
                 df_f["Phone"] = df_f["Staff Name"].map(staff_to_phone).fillna("")
                 df_f["Email"] = df_f["Staff Name"].map(staff_to_email).fillna("")
 
+    # ---- Zoho Case Coordinator merge ----
+    df_f["Case Coordinator Name"] = ""
+
+    if zoho_file is not None:
+        zoho_df = read_any(zoho_file)
+        if zoho_df is not None:
+            zoho_df = normalize_cols(zoho_df)
+
+            zoho_required = {"Medicaid ID", "Case Coordinator Name"}
+            zoho_missing = zoho_required - set(zoho_df.columns)
+            if zoho_missing:
+                st.error(f"Zoho file is missing columns: {sorted(zoho_missing)}")
+            else:
+                # Normalize Medicaid ID for matching
+                zoho_df["_medicaid_norm"] = zoho_df["Medicaid ID"].astype(str).str.strip().str.upper()
+
+                # Parse DOB if available for fallback matching
+                if "Date of Birth" in zoho_df.columns:
+                    zoho_df["_dob"] = pd.to_datetime(zoho_df["Date of Birth"], errors="coerce")
+                else:
+                    zoho_df["_dob"] = pd.NaT
+
+                # Build lookup dicts
+                medicaid_to_cc = (
+                    zoho_df.dropna(subset=["Medicaid ID"])
+                    .set_index("_medicaid_norm")["Case Coordinator Name"]
+                    .to_dict()
+                )
+
+                dob_to_cc = {}
+                if zoho_df["_dob"].notna().any():
+                    dob_to_cc = (
+                        zoho_df.dropna(subset=["_dob"])
+                        .drop_duplicates(subset=["_dob"])
+                        .set_index("_dob")["Case Coordinator Name"]
+                        .to_dict()
+                    )
+
+                # Primary match: Insurance ID → Medicaid ID
+                insurance_id_col = "Client: Insurance ID"
+                if insurance_id_col in df_f.columns:
+                    df_f["_insured_norm"] = df_f[insurance_id_col].astype(str).str.strip().str.upper()
+                    df_f["Case Coordinator Name"] = df_f["_insured_norm"].map(medicaid_to_cc).fillna("")
+                    df_f.drop(columns=["_insured_norm"], inplace=True)
+
+                # Fallback match: DOB
+                if dob_to_cc and "Date of Birth" in df_f.columns:
+                    df_f["_dob_dt"] = pd.to_datetime(df_f["Date of Birth"], errors="coerce")
+                    missing_cc = df_f["Case Coordinator Name"] == ""
+                    df_f.loc[missing_cc, "Case Coordinator Name"] = (
+                        df_f.loc[missing_cc, "_dob_dt"].map(dob_to_cc).fillna("")
+                    )
+                    df_f.drop(columns=["_dob_dt"], inplace=True)
+
+                matched_count = (df_f["Case Coordinator Name"] != "").sum()
+                st.success(f"Zoho match: {matched_count} of {len(df_f)} sessions matched a Case Coordinator.")
+
     df_f["Daily Minutes"] = df_f.groupby(["Staff Name", "Date"])["Actual Minutes"].transform("sum")
     df_f["Daily Session Count"] = df_f.groupby(["Client Name", "Date", "Session"])["Session"].transform("count")
 
@@ -506,6 +571,7 @@ with tab2:
         "Staff Name",
         "Phone",
         "Email",
+        "Case Coordinator Name",
         "Duration",
         "Actual Minutes",
         "Notes Minutes",
