@@ -167,10 +167,29 @@ def parse_notes(text: str):
         if pos != -1:
             present_text = block[pos: pos + 400]
 
-        present_client = bool(re.search(r"\bClient\b", present_text, re.I))
-        present_bt = bool(re.search(r"\b(BT/RBT|RBT/BT)\b", present_text, re.I))
-        present_caregiver = bool(re.search(r"\bAdult Caregiver\b", present_text, re.I))
-        present_sibling = bool(re.search(r"\bSibling(s)?\b", present_text, re.I))
+        present_client = bool(
+            re.search(r"\bClient\b", present_text, re.I)
+        )
+
+        present_bt = bool(
+            re.search(
+                r"\b(?:BT\s*/\s*RBT|RBT\s*/\s*BT|Behavior Technician\s*/\s*Registered Behavior Technician)\b",
+                present_text,
+                re.I,
+            )
+        )
+
+        present_caregiver = bool(
+            re.search(
+                r"\b(?:Adult Caregiver|Caregiver)\b",
+                present_text,
+                re.I,
+            )
+        )
+
+        present_sibling = bool(
+            re.search(r"\bSibling(?:s)?\b", present_text, re.I)
+        )
 
         maladaptive_section = ""
         section_match = re.search(
