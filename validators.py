@@ -88,6 +88,18 @@ def note_parse_ok(row) -> bool:
     return bool(val)
 
 
+def pdf_time_accurate_ok(row) -> bool:
+    """
+    Returns False only when the PDF session time was verifiably wrong vs the
+    Excel scheduled time.  NaN (unresolvable or no Excel time) is treated as
+    passing — we don't penalise what we can't check.
+    """
+    val = row.get("_PDF_Time_Accurate")
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return True
+    return bool(val)
+
+
 def sig_ok_base(row) -> bool:
     base_ts = row.get("_End_dt", pd.NaT)
     parent_sig_ts = row.get("_ParentSig_dt", pd.NaT)
@@ -118,6 +130,7 @@ def evaluate_row(row) -> dict:
     daily_ok_val = daily_total_ok(row)
     note_ok_val = note_attendance_ok(row)
     note_parse_ok_val = note_parse_ok(row)
+    pdf_time_ok_val = pdf_time_accurate_ok(row)
 
     # Gap check disabled
     gap_ok_val = row.get("_SessionGapOk", True)
@@ -135,6 +148,7 @@ def evaluate_row(row) -> dict:
         and daily_ok_val
         and note_ok_val
         and note_parse_ok_val
+        and pdf_time_ok_val
         and gap_ok_val
     )
 
@@ -145,6 +159,7 @@ def evaluate_row(row) -> dict:
         "daily_ok": daily_ok_val,
         "note_ok": note_ok_val,
         "note_parse_ok": note_parse_ok_val,
+        "pdf_time_ok": pdf_time_ok_val,
         "gap_ok": gap_ok_val,
         "has_time_adj_sig": adj_sig,
         "overall_pass": overall,
@@ -209,6 +224,12 @@ def get_failure_reasons(row) -> str:
                 f"(minimum {MIN_SESSION_GAP_MINUTES} min required)"
             )
             
+    if not eval_res.get("pdf_time_ok", True):
+        pdf_time = row.get("Session Time", "")
+        reasons.append(
+            f"Session note time ({pdf_time}) does not match scheduled time in Excel"
+        )
+
     if not eval_res.get("note_ok", True):
         missing = []
 

@@ -281,6 +281,16 @@ with tab2:
     df_f["Staff Name"] = df_f["User"].apply(normalize_client_name_for_match)
     df_f["Client Name"] = df_f["Client"].apply(normalize_client_name_for_match)
 
+    # ---- Parse Excel session times (Date/Time = start, End time = end) ----
+    df_f["_ExcelStart_dt"] = (
+        pd.to_datetime(df_f["Date/Time"], errors="coerce")
+        if "Date/Time" in df_f.columns else pd.NaT
+    )
+    df_f["_ExcelEnd_dt"] = (
+        pd.to_datetime(df_f["End time"], errors="coerce")
+        if "End time" in df_f.columns else pd.NaT
+    )
+
     # ---- External session matching ----
     if external_sessions_df is not None:
         ext_df = normalize_cols(external_sessions_df.copy())
@@ -320,22 +330,25 @@ with tab2:
 
                         # ---- MERGE DEBUGGING ----
             with st.expander("🔍 Merge Debug", expanded=True):
-                total = len(df_f)
-                matched = df_f["Session Time"].notna().sum()
+                _debug_mask = df_f["Client Name"].astype(str).str.lower().str.contains("demo|marry", na=False)
+                _df_debug = df_f[~_debug_mask]
+
+                total = len(_df_debug)
+                matched = _df_debug["Session Time"].notna().sum()
                 unmatched = total - matched
                 st.write(f"**Total rows:** {total} | **Matched (got Session Time):** {matched} | **Unmatched:** {unmatched}")
 
                 st.write("**ext_df Insurance IDs (sample):**", ext_df["Client: Insurance ID"].dropna().unique()[:10].tolist())
-                st.write("**df_f Insurance IDs (sample):**", df_f["Client: Insurance ID"].dropna().unique()[:10].tolist())
+                st.write("**df_f Insurance IDs (sample):**", _df_debug["Client: Insurance ID"].dropna().unique()[:10].tolist())
 
                 st.write("**SessionIndex range in ext_df:**", ext_df["SessionIndex"].min(), "–", ext_df["SessionIndex"].max())
-                st.write("**SessionIndex range in df_f:**", df_f["SessionIndex"].min(), "–", df_f["SessionIndex"].max())
+                st.write("**SessionIndex range in df_f:**", _df_debug["SessionIndex"].min(), "–", _df_debug["SessionIndex"].max())
 
-                unmatched_df = df_f[df_f["Session Time"].isna()][["Client Name", "Client: Insurance ID", "SessionIndex", "Date"]].head(20)
+                unmatched_df = _df_debug[_df_debug["Session Time"].isna()][["Client Name", "Client: Insurance ID", "SessionIndex", "Date"]].head(20)
                 st.write("**Unmatched rows (first 20):**")
                 st.dataframe(unmatched_df, use_container_width=True)
 
-                matched_df = df_f[df_f["Session Time"].notna()][["Client Name", "Client: Insurance ID", "SessionIndex", "Date", "Session Time"]].head(20)
+                matched_df = _df_debug[_df_debug["Session Time"].notna()][["Client Name", "Client: Insurance ID", "SessionIndex", "Date", "Session Time"]].head(20)
                 st.write("**Matched rows (first 20):**")
                 st.dataframe(matched_df, use_container_width=True)
             # ---- END MERGE DEBUGGING ----
@@ -357,25 +370,39 @@ with tab2:
                     else normalize_session_time(v)
                 )
 
-                # ---- Resolve ambiguous AM/PM using signature time ----
+                # ---- Resolve ambiguous AM/PM: Excel times first, signature fallback ----
                 ambiguous_mask = df_f["Session Time"].astype(str).str.contains("⚠️", na=False)
 
                 if ambiguous_mask.any():
-                    def resolve_with_sig(row):
+                    def resolve_ampm(row):
                         time_str = str(row["Session Time"])
                         clean = time_str.replace("  ⚠️ AM/PM unknown", "").strip()
+
+                        # Primary: use Excel start/end datetimes — ground truth
+                        excel_start = row.get("_ExcelStart_dt")
+                        excel_end   = row.get("_ExcelEnd_dt")
+                        if pd.notna(excel_start) and pd.notna(excel_end):
+                            m = re.match(
+                                r"(\d{1,2}:\d{2})\s*AM\s*-\s*(\d{1,2}:\d{2})\s*AM",
+                                clean, re.I,
+                            )
+                            if m:
+                                start_ap = "PM" if excel_start.hour >= 12 else "AM"
+                                end_ap   = "PM" if excel_end.hour   >= 12 else "AM"
+                                return f"{m.group(1)} {start_ap} - {m.group(2)} {end_ap}"
+
+                        # Fallback: use parent caregiver signature time
                         sig_dt = row.get("_ParentSig_dt")
                         if pd.notna(sig_dt):
-                            # Signature in PM → flip to PM
                             if sig_dt.hour >= 12:
                                 return clean.replace("AM", "PM")
-                            # Signature in AM → keep AM
                             return clean
-                        # No signature → keep ⚠️ flag for manual review
+
+                        # No resolution possible — keep ⚠️ for manual review
                         return time_str
 
                     df_f.loc[ambiguous_mask, "Session Time"] = df_f[ambiguous_mask].apply(
-                        resolve_with_sig, axis=1
+                        resolve_ampm, axis=1
                     )
 
             df_f["Has External Session"] = (
@@ -394,13 +421,21 @@ with tab2:
                 & df_f["_ExtEnd_dt"].notna()
             )
 
+            # Note Minutes — derived from PDF session time (what the BT documented)
             df_f["Note Minutes"] = np.nan
             df_f.loc[has_ext_valid, "Note Minutes"] = (
                 (df_f.loc[has_ext_valid, "_ExtEnd_dt"] - df_f.loc[has_ext_valid, "_ExtStart_dt"])
                 .dt.total_seconds()
                 / 60.0
             )
-            df_f.loc[has_ext_valid, "_End_dt"] = df_f.loc[has_ext_valid, "_ExtEnd_dt"]
+
+            # _End_dt — used for signature timing check.
+            # Prefer Excel end time (ground truth); fall back to PDF-parsed end time.
+            has_excel_end = df_f["_ExcelEnd_dt"].notna()
+            df_f.loc[has_excel_end, "_End_dt"] = df_f.loc[has_excel_end, "_ExcelEnd_dt"]
+            df_f.loc[~has_excel_end & has_ext_valid, "_End_dt"] = (
+                df_f.loc[~has_excel_end & has_ext_valid, "_ExtEnd_dt"]
+            )
 
             # Duration Match: True if within 1 minute
             df_f["Duration Match"] = (
@@ -408,6 +443,36 @@ with tab2:
                 & df_f["Note Minutes"].notna()
                 & ((df_f["Actual Minutes"] - df_f["Note Minutes"]).abs() <= 1)
             )
+
+            # ---- PDF Time vs Excel Time accuracy check ----
+            def _pdf_time_matches_excel(row):
+                pdf_time = str(row.get("Session Time", "") or "")
+                if not pdf_time or pdf_time == "nan" or "⚠️" in pdf_time:
+                    return np.nan  # still unresolved or missing — can't verify
+
+                excel_start = row.get("_ExcelStart_dt")
+                excel_end   = row.get("_ExcelEnd_dt")
+                if pd.isna(excel_start) or pd.isna(excel_end):
+                    return np.nan  # no Excel time to compare against
+
+                m = re.match(
+                    r"(\d{1,2}):(\d{2})\s*(AM|PM)\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)",
+                    pdf_time, re.I,
+                )
+                if not m:
+                    return False
+
+                def to_24h(h, ap):
+                    return int(h) % 12 + (12 if ap.upper() == "PM" else 0)
+
+                return (
+                    to_24h(m.group(1), m.group(3)) == excel_start.hour
+                    and int(m.group(2))             == excel_start.minute
+                    and to_24h(m.group(4), m.group(6)) == excel_end.hour
+                    and int(m.group(5))             == excel_end.minute
+                )
+
+            df_f["_PDF_Time_Accurate"] = df_f.apply(_pdf_time_matches_excel, axis=1)
 
         else:
             st.warning("External sessions data provided, but required columns are missing.")
@@ -543,6 +608,12 @@ with tab2:
                     if gap_minutes < MIN_SESSION_GAP_MINUTES:
                         df_f.at[idx, "_SessionGapOk"] = False
 
+    # Expose _PDF_Time_Accurate as a readable display column
+    if "_PDF_Time_Accurate" in df_f.columns:
+        df_f["PDF Time Matches Excel"] = df_f["_PDF_Time_Accurate"].map(
+            {True: "✅ Match", False: "❌ Mismatch", np.nan: "—"}
+        ).fillna("—")
+
     eval_results = df_f.apply(evaluate_row, axis=1, result_type="expand")
     df_f["_DurationOk"] = eval_results["duration_ok"]
     df_f["_SigOk"] = eval_results["sig_ok"]
@@ -551,6 +622,7 @@ with tab2:
     df_f["_HasTimeAdjSig"] = eval_results["has_time_adj_sig"]
     df_f["_NoteOk"] = eval_results["note_ok"]
     df_f["_NoteParseOk"] = eval_results["note_parse_ok"]
+    df_f["_PdfTimeOk"] = eval_results["pdf_time_ok"]
     df_f["_GapOk"] = eval_results["gap_ok"]
     df_f["_OverallPass"] = eval_results["overall_pass"]
 
@@ -580,6 +652,7 @@ with tab2:
         "Duration Match",
         "Adult Caregiver signature time",
         "Session Time",
+        "PDF Time Matches Excel",
         "Note Compliance Errors",
     ]
     if TIME_ADJ_COL in df_f.columns:

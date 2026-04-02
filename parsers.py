@@ -147,11 +147,11 @@ def parse_notes(text: str):
         ins_id_match = re.search(r"Insurance ID\s*:\s*([A-Z0-9]+)", block, re.I)
         insurance_id = ins_id_match.group(1).strip() if ins_id_match else ""
 
-        date_match = re.search(rf"Session Date\s*:\s*{DATE_RE}", block, re.I)
+        date_match = re.search(rf"(?:Session\s+)?Date\b(?!\s+of\b)\s*:\s*{DATE_RE}", block, re.I)
         session_date = normalize_date(date_match.group(1)) if date_match else ""
 
         raw_session_time = ""
-        m_time = re.search(r"(?im)^\s*Session Time\s*:\s*(.*)\s*$", block)
+        m_time = re.search(r"(?im)^\s*Session Times?\s*:\s*(.*)\s*$", block)
         if m_time:
             raw_session_time = m_time.group(1).strip()
             if raw_session_time in ("-", "–", "—"):
@@ -159,11 +159,23 @@ def parse_notes(text: str):
 
         session_time = normalize_time_range(raw_session_time)
 
-        location_match = re.search(r"Session Location[ \t]*:[ \t]*([^\r\n]*)", block)
+        # Same-line value (old inline format)
+        location_match = re.search(r"Session Location[ \t]*:[ \t]*([^\r\n]+)", block)
         session_location = location_match.group(1).strip() if location_match else ""
+        # Next-line value (new table format — value is in the right cell, extracted on its own line)
+        if not session_location:
+            loc_next = re.search(r"Session Location[ \t]*:\s*\n\s*([^\r\n]+)", block)
+            if loc_next:
+                candidate = loc_next.group(1).strip()
+                # Exclude lines that are section headers (end with ":")
+                if candidate and not candidate.endswith(":"):
+                    session_location = candidate
 
         present_text = ""
-        pos = block.lower().find("present at session")
+        lower_block = block.lower()
+        pos = lower_block.find("present at session")
+        if pos == -1:
+            pos = lower_block.find("individuals present")
         if pos != -1:
             present_text = block[pos: pos + 400]
 
