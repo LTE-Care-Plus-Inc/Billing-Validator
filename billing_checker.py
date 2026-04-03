@@ -266,6 +266,7 @@ with tab2:
     df_f = df[
         (df["Status"].astype(str).str.strip().isin(STATUS_REQUIRED))
         & (df["Session"].astype(str).str.strip() == SESSION_REQUIRED)
+        & (df["AlohaABA Appointment Type"].astype(str).str.strip() != "Supervision")
     ].copy()
 
     df_f["_RowOrder"] = np.arange(len(df_f))
@@ -276,7 +277,10 @@ with tab2:
     df_f["Date"] = pd.to_datetime(start_clean, errors="coerce").dt.strftime("%m/%d/%Y")
 
     df_f["_End_dt"] = pd.NaT
-    df_f["_ParentSig_dt"] = pd.to_datetime(df_f["Adult Caregiver signature time"], errors="coerce")
+    df_f["_ParentSig_dt"] = (
+        pd.to_datetime(df_f["Adult Caregiver signature time"], errors="coerce", utc=True)
+        .dt.tz_convert(None)
+    )
 
     df_f["Staff Name"] = df_f["User"].apply(normalize_client_name_for_match)
     df_f["Client Name"] = df_f["Client"].apply(normalize_client_name_for_match)
@@ -631,7 +635,8 @@ with tab2:
     for col in ["Adult Caregiver signature time"]:
         if col in df_f.columns:
             df_f[col] = (
-                pd.to_datetime(df_f[col], errors="coerce")
+                pd.to_datetime(df_f[col], errors="coerce", utc=True)
+                .dt.tz_convert(None)
                 .dt.strftime("%m/%d/%Y %I:%M:%S %p")
                 .fillna("")
             )

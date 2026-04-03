@@ -176,8 +176,13 @@ def parse_notes(text: str):
         pos = lower_block.find("present at session")
         if pos == -1:
             pos = lower_block.find("individuals present")
+        if pos == -1:
+            pos = lower_block.find("individual present")
         if pos != -1:
-            present_text = block[pos: pos + 400]
+            present_text = block[pos: pos + 1500]
+
+        # Slash variants: U+002F (standard), U+2215 (∕), U+2044 (⁄), U+FF0F (／)
+        _SLASH = r"[\u002F\u2215\u2044\uFF0F]"
 
         present_client = bool(
             re.search(r"\bClient\b", present_text, re.I)
@@ -185,7 +190,8 @@ def parse_notes(text: str):
 
         present_bt = bool(
             re.search(
-                r"\b(?:BT\s*/\s*RBT|RBT\s*/\s*BT|Behavior Technician\s*/\s*Registered Behavior Technician)\b",
+                rf"\b(?:BT\s*{_SLASH}\s*RBT|RBT\s*{_SLASH}\s*BT"
+                rf"|Behavior\s+Technician\s*{_SLASH}\s*Registered\s+Behavior\s+Technician)\b",
                 present_text,
                 re.I,
             )

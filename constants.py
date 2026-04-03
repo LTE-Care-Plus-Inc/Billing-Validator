@@ -15,6 +15,7 @@ TIME_ADJ_COL = "Adult Caregiver’s Signature Approval for Time Adjustment signa
 REQ_COLS = [
     "Status",
     "AlohaABA Appointment ID",
+    "AlohaABA Appointment Type",
     "Client",
     "Duration",
     "Session",

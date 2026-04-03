@@ -220,8 +220,10 @@ def test_time_regex_new_label():
 # Attendees regex — old vs new label
 # =====================================================
 
+_SLASH = r"[\u002F\u2215\u2044\uFF0F]"
 _BT_PATTERN = re.compile(
-    r"\b(?:BT\s*/\s*RBT|RBT\s*/\s*BT|Behavior Technician\s*/\s*Registered Behavior Technician)\b",
+    rf"\b(?:BT\s*{_SLASH}\s*RBT|RBT\s*{_SLASH}\s*BT"
+    rf"|Behavior Technician\s*{_SLASH}\s*Registered Behavior Technician)\b",
     re.I,
 )
 _CAREGIVER_PATTERN = re.compile(r"\b(?:Adult Caregiver|Caregiver)\b", re.I)
@@ -233,7 +235,9 @@ def _get_present_text(block: str) -> str:
     pos = lower.find("present at session")
     if pos == -1:
         pos = lower.find("individuals present")
-    return block[pos: pos + 400] if pos != -1 else ""
+    if pos == -1:
+        pos = lower.find("individual present")
+    return block[pos: pos + 1500] if pos != -1 else ""
 
 
 def test_attendees_old_label():
@@ -249,6 +253,62 @@ def test_attendees_new_label():
     pt = _get_present_text(block)
     assert bool(_CLIENT_PATTERN.search(pt))
     assert bool(_BT_PATTERN.search(pt))
+    assert bool(_CAREGIVER_PATTERN.search(pt))
+
+
+def test_attendees_caregiver_client_first_order():
+    """New template order: Caregiver, Client, Behavior Technician / RBT — all must pass."""
+    block = (
+        "Individuals Present: Caregiver, Client, Behavior Technician / Registered Behavior Technician, "
+        "Board Certified Behavior Analysis / Licensed Behavior Analysis"
+    )
+    pt = _get_present_text(block)
+    assert bool(_CLIENT_PATTERN.search(pt)), "Client should be found"
+    assert bool(_BT_PATTERN.search(pt)), "BT/RBT should be found"
+    assert bool(_CAREGIVER_PATTERN.search(pt)), "Caregiver should be found"
+
+
+def test_attendees_bt_slash_division_sign():
+    """PDF may extract slash as U+2215 ∕ (DIVISION SLASH) — regex must still match."""
+    block = "Individuals Present: Caregiver, Client, Behavior Technician \u2215 Registered Behavior Technician"
+    pt = _get_present_text(block)
+    assert bool(_BT_PATTERN.search(pt)), "U+2215 slash should match"
+
+
+def test_attendees_bt_slash_fraction_slash():
+    """PDF may extract slash as U+2044 ⁄ (FRACTION SLASH) — regex must still match."""
+    block = "Individuals Present: Caregiver, Client, Behavior Technician \u2044 Registered Behavior Technician"
+    pt = _get_present_text(block)
+    assert bool(_BT_PATTERN.search(pt)), "U+2044 slash should match"
+
+
+def test_attendees_large_window_column_by_column():
+    """Column-by-column table extraction puts many labels before the value.
+    The 1500-char window must still capture the attendee value."""
+    # Simulate fitz extracting all labels in left column, then all values in right column
+    labels = "\n".join([
+        "Individuals Present:",
+        "Maladaptive Behaviors:",
+        "Data Collected:",
+        "Session Summary:",
+        "Outcome of Treatment:",
+        "BT Attestation:",
+        "Provider Signature:",
+        "Revision Attestation:",
+        "Other Field A:",
+        "Other Field B:",
+        "Other Field C:",
+        "Other Field D:",
+        "Other Field E:",
+        "Other Field F:",
+        "Other Field G:",
+    ])
+    value = "Caregiver, Client, Behavior Technician / Registered Behavior Technician, Board Certified Behavior Analysis / Licensed Behavior Analysis"
+    block = labels + "\n\n" + value
+    gap = len(labels) + 2  # chars between label and value
+    pt = _get_present_text(block)
+    assert bool(_BT_PATTERN.search(pt)), f"BT not found; gap={gap}, pt length={len(pt)}"
+    assert bool(_CLIENT_PATTERN.search(pt))
     assert bool(_CAREGIVER_PATTERN.search(pt))
 
 
