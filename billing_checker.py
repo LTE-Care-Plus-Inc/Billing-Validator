@@ -165,6 +165,7 @@ with tab1:
                     "Session Time",
                     "Session Date",
                     "Insurance ID",
+                    "Date of Birth",          # needed for DOB-fallback matching in Tab 2
                     "Present_Client",
                     "Present_Adult_Caregiver",
                     "Present_Sibling",
@@ -302,16 +303,11 @@ with tab2:
         if ensure_cols(ext_df, ["Insurance ID", "Session Time"], "External Sessions File"):
             ext_df["Client Name"] = ext_df["Client"].apply(normalize_client_name_for_match)
 
-            # FIX: Rename ext_df "Insurance ID" → "Client: Insurance ID" so both
-            # dataframes share the same column name before grouping and merging.
+            # Rename so both sides share the same column name
             ext_df = ext_df.rename(columns={"Insurance ID": "Client: Insurance ID"})
 
-            ext_df["SessionIndex"] = ext_df.groupby("Client: Insurance ID").cumcount()
-            df_f["SessionIndex"] = df_f.groupby("Client: Insurance ID").cumcount()
-
-            merge_cols = [
-                "Client: Insurance ID",
-                "SessionIndex",
+            # Payload columns to bring over from the PDF notes (not join keys)
+            _data_cols = [c for c in [
                 "Session Time",
                 "Session Date",
                 "Present_Client",
@@ -320,27 +316,69 @@ with tab2:
                 "Present_BT_RBT",
                 "Note Parse PASS",
                 "Note Compliance Errors",
-            ]
-            merge_cols = [c for c in merge_cols if c in ext_df.columns]
+            ] if c in ext_df.columns]
+
+            # ── PRIMARY MERGE: Insurance ID + positional index ───────────────
+            ext_df["SessionIndex"] = ext_df.groupby("Client: Insurance ID").cumcount()
+            df_f["SessionIndex"]   = df_f.groupby("Client: Insurance ID").cumcount()
 
             df_f = df_f.merge(
-                ext_df[merge_cols],
+                ext_df[["Client: Insurance ID", "SessionIndex"] + _data_cols],
                 on=["Client: Insurance ID", "SessionIndex"],
                 how="left",
                 sort=False,
             )
 
+            # ── FALLBACK MERGE: DOB + positional index ───────────────────────
+            # Only runs for rows that didn't get a Session Time from the primary merge.
+            _unmatched = df_f["Session Time"].isna()
+            _ext_has_dob = "Date of Birth" in ext_df.columns
+            _df_has_dob  = "Client: Date of Birth" in df_f.columns
+
+            if _unmatched.any() and _ext_has_dob and _df_has_dob:
+                # Normalize to date-only (strip time component) for stable comparison
+                ext_df["_dob_norm"] = pd.to_datetime(
+                    ext_df["Date of Birth"], errors="coerce"
+                ).dt.normalize()
+                df_f["_dob_norm"] = pd.to_datetime(
+                    df_f["Client: Date of Birth"], errors="coerce"
+                ).dt.normalize()
+
+                # Positional index within each DOB group (mirrors Insurance ID logic)
+                ext_df["_SIdx_DOB"] = ext_df.groupby("_dob_norm").cumcount()
+                df_f["_SIdx_DOB"]   = df_f.groupby("_dob_norm").cumcount()
+
+                dob_result = (
+                    df_f.loc[_unmatched, ["_dob_norm", "_SIdx_DOB"]]
+                    .merge(
+                        ext_df[["_dob_norm", "_SIdx_DOB"] + _data_cols],
+                        on=["_dob_norm", "_SIdx_DOB"],
+                        how="left",
+                        sort=False,
+                    )
+                )
+                for col in _data_cols:
+                    if col in dob_result.columns:
+                        df_f.loc[_unmatched, col] = dob_result[col].values
+
+                df_f.drop(columns=["_dob_norm", "_SIdx_DOB"], errors="ignore", inplace=True)
+                ext_df.drop(columns=["_dob_norm", "_SIdx_DOB"], errors="ignore", inplace=True)
+
             df_f = df_f.sort_values("_RowOrder", kind="mergesort").reset_index(drop=True)
 
-                        # ---- MERGE DEBUGGING ----
+            # ---- MERGE DEBUGGING ----
             with st.expander("🔍 Merge Debug", expanded=True):
                 _debug_mask = df_f["Client Name"].astype(str).str.lower().str.contains("demo|marry", na=False)
                 _df_debug = df_f[~_debug_mask]
 
-                total = len(_df_debug)
-                matched = _df_debug["Session Time"].notna().sum()
-                unmatched = total - matched
-                st.write(f"**Total rows:** {total} | **Matched (got Session Time):** {matched} | **Unmatched:** {unmatched}")
+                total    = len(_df_debug)
+                matched  = _df_debug["Session Time"].notna().sum()
+                still_unmatched = total - matched
+                st.write(
+                    f"**Total rows:** {total} | "
+                    f"**Matched (Insurance ID or DOB):** {matched} | "
+                    f"**Still unmatched:** {still_unmatched}"
+                )
 
                 st.write("**ext_df Insurance IDs (sample):**", ext_df["Client: Insurance ID"].dropna().unique()[:10].tolist())
                 st.write("**df_f Insurance IDs (sample):**", _df_debug["Client: Insurance ID"].dropna().unique()[:10].tolist())
@@ -348,11 +386,15 @@ with tab2:
                 st.write("**SessionIndex range in ext_df:**", ext_df["SessionIndex"].min(), "–", ext_df["SessionIndex"].max())
                 st.write("**SessionIndex range in df_f:**", _df_debug["SessionIndex"].min(), "–", _df_debug["SessionIndex"].max())
 
-                unmatched_df = _df_debug[_df_debug["Session Time"].isna()][["Client Name", "Client: Insurance ID", "SessionIndex", "Date"]].head(20)
-                st.write("**Unmatched rows (first 20):**")
+                unmatched_df = _df_debug[_df_debug["Session Time"].isna()][[
+                    "Client Name", "Client: Insurance ID", "SessionIndex", "Date"
+                ]].head(20)
+                st.write("**Still-unmatched rows (first 20):**")
                 st.dataframe(unmatched_df, use_container_width=True)
 
-                matched_df = _df_debug[_df_debug["Session Time"].notna()][["Client Name", "Client: Insurance ID", "SessionIndex", "Date", "Session Time"]].head(20)
+                matched_df = _df_debug[_df_debug["Session Time"].notna()][[
+                    "Client Name", "Client: Insurance ID", "SessionIndex", "Date", "Session Time"
+                ]].head(20)
                 st.write("**Matched rows (first 20):**")
                 st.dataframe(matched_df, use_container_width=True)
             # ---- END MERGE DEBUGGING ----
@@ -575,8 +617,8 @@ with tab2:
                     df_f.drop(columns=["_insured_norm"], inplace=True)
 
                 # Fallback match: DOB
-                if dob_to_cc and "Date of Birth" in df_f.columns:
-                    df_f["_dob_dt"] = pd.to_datetime(df_f["Date of Birth"], errors="coerce")
+                if dob_to_cc and "Client: Date of Birth" in df_f.columns:
+                    df_f["_dob_dt"] = pd.to_datetime(df_f["Client: Date of Birth"], errors="coerce")
                     missing_cc = df_f["Case Coordinator Name"] == ""
                     df_f.loc[missing_cc, "Case Coordinator Name"] = (
                         df_f.loc[missing_cc, "_dob_dt"].map(dob_to_cc).fillna("")
