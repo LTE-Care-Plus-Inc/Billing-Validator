@@ -161,6 +161,9 @@ def clean_time_text(s: str) -> str:
     # Chinese markers (if intact)
     s = s.replace("上午", "am ").replace("下午", "pm ")
 
+    # Korean markers (if intact): 오전 = AM, 오후 = PM
+    s = s.replace("오전", "am ").replace("오후", "pm ")
+
     # unify dash variants
     s = s.replace("–", "-").replace("—", "-").replace("−", "-")
 
@@ -336,5 +339,11 @@ def normalize_date(raw: str) -> str:
             month, day = p1, p2
 
         return f"{month:02d}/{day:02d}/{y:04d}"
+
+    # Korean spaced-dot format: "2026. 3. 14." or "2016. 7. 10."
+    m_korean = re.match(r"^(\d{4})\.\s+(\d{1,2})\.\s+(\d{1,2})\.?$", raw)
+    if m_korean:
+        y, mo, d = map(int, m_korean.groups())
+        return f"{mo:02d}/{d:02d}/{y:04d}"
 
     return raw

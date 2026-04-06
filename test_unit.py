@@ -167,7 +167,13 @@ def test_extract_invalid():
 # Session date regex — new vs old template labels
 # =====================================================
 
-DATE_RE = r"(\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2}|\d{1,2}[-/\.]\d{1,2}[-/\.]\d{4})"
+DATE_RE = (
+    r"("
+    r"\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2}"
+    r"|\d{1,2}[-/\.]\d{1,2}[-/\.]\d{4}"
+    r"|\d{4}\.\s+\d{1,2}\.\s+\d{1,2}\.?"   # Korean spaced-dot
+    r")"
+)
 _DATE_PATTERN = re.compile(rf"(?:Session\s+)?Date\b(?!\s+of\b)\s*:\s*{DATE_RE}", re.I)
 
 
@@ -195,6 +201,48 @@ def test_date_regex_ignores_dob_only_block():
     block = "Date of Birth: 1/18/2020"
     m = _DATE_PATTERN.search(block)
     assert m is None
+
+
+def test_date_regex_korean_session_date():
+    """Korean spaced-dot format: '__Session Date__: 2026. 3. 14.'"""
+    m = _DATE_PATTERN.search("Session Date: 2026. 3. 14.")
+    assert m, "No match for Korean session date"
+    assert m.group(1).strip().rstrip(".") == "2026. 3. 14"
+
+
+def test_date_regex_korean_dob():
+    """Korean DOB must not be confused with session date."""
+    block = "Date of Birth: 2016. 7. 10.\nSession Date: 2026. 3. 14."
+    matches = list(_DATE_PATTERN.finditer(block))
+    # Should only match the Session Date line, not Date of Birth
+    assert len(matches) == 1, f"Expected 1 match, got {len(matches)}: {[m.group(0) for m in matches]}"
+    assert "2026" in matches[0].group(1)
+
+
+def test_normalize_date_korean():
+    """normalize_date should convert '2026. 3. 14.' → '03/14/2026'."""
+    from utils import normalize_date
+    assert normalize_date("2026. 3. 14.") == "03/14/2026"
+    assert normalize_date("2016. 7. 10.") == "07/10/2016"
+    assert normalize_date("2026. 3. 14") == "03/14/2026"   # without trailing dot
+
+
+def test_korean_pm_intact():
+    """오후 = PM — Korean afternoon marker."""
+    result = normalize_time_range("오후 1:00 - 오후 5:00")
+    assert result == "01:00 PM - 05:00 PM", f"Got: {result!r}"
+
+
+def test_korean_am_intact():
+    """오전 = AM — Korean morning marker."""
+    result = normalize_time_range("오전 9:00 - 오후 1:00")
+    assert result == "09:00 AM - 01:00 PM", f"Got: {result!r}"
+
+
+def test_korean_cross_noon():
+    """오전 start, 오후 end — like the sample: 오전 9:00 - 오후 1:00."""
+    result = normalize_time_range("오전 9:00 - 오후 1:00")
+    assert result == "09:00 AM - 01:00 PM", f"Got: {result!r}"
 
 
 # =====================================================
