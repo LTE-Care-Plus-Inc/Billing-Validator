@@ -7,3 +7,7 @@ __pycache__/
 *.pyd
 .env
 dynamicAnalytics/
+docker-compose.yml
+docker-compose.streamlit.yml
+run-sonarqube-report.ps1
+sonar-project.properties
