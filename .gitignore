@@ -11,3 +11,5 @@ docker-compose.yml
 docker-compose.streamlit.yml
 run-sonarqube-report.ps1
 sonar-project.properties
+test-data/
+local-k8s/

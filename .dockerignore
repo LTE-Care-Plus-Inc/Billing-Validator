@@ -1,5 +1,10 @@
 .git
 .gitignore
+.env
+.env.*
+*.pem
+id_rsa
+*.key
 .venv
 venv
 __pycache__/
@@ -14,3 +19,18 @@ Thumbs.db
 .cursor/
 agent-transcripts/
 *.log
+# CI / local tooling (not needed in the app image)
+run-sonarqube-report.ps1
+sonar-project.properties
+sonarqube-*.md
+docker-compose*.yml
+tests/
+test_unit.py
+old.py
+notes.py
+merge.py
+billing_checker2.py
+HiRasmus_Billing_Session_Checker_Spec.md
+local-k8s/
+test-data/
+dynamicAnalytics/
