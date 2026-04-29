@@ -2,10 +2,7 @@
 # app.py
 # ===========================
 import re
-import time
-import logging
 from difflib import SequenceMatcher
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -51,47 +48,6 @@ st.set_page_config(
     layout="wide",
 )
 st.title("Session Compliance Checker")
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("billing-validator-timer")
-
-
-def _ensure_perf_log():
-    if "perf_timers" not in st.session_state:
-        st.session_state["perf_timers"] = []
-
-
-def _log_timer(stage: str, seconds: float, details: str = ""):
-    _ensure_perf_log()
-    seconds_rounded = round(float(seconds), 3)
-    st.session_state["perf_timers"].append(
-        {
-            "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "Stage": stage,
-            "Seconds": seconds_rounded,
-            "Details": details,
-        }
-    )
-    logger.info("[TIMER] stage='%s' seconds=%.3f details='%s'", stage, seconds_rounded, details)
-
-
-def _perf_log_ui():
-    _ensure_perf_log()
-    with st.sidebar.expander("Performance Timer Log", expanded=False):
-        if not st.session_state["perf_timers"]:
-            st.caption("No timing data yet. Run uploads/checkers to capture baseline.")
-            return
-        perf_df = pd.DataFrame(st.session_state["perf_timers"])
-        st.dataframe(perf_df, use_container_width=True, height=240)
-        st.download_button(
-            "⬇️ Download Timer Baseline (.csv)",
-            data=perf_df.to_csv(index=False).encode("utf-8"),
-            file_name="performance_timer_baseline.csv",
-            key="download_perf_baseline",
-        )
-
-
-_perf_log_ui()
 
 # -----------------------------
 # SIDEBAR CONTROLS
@@ -182,7 +138,6 @@ with tab1:
     )
 
     if pdf_file is not None:
-        _tab1_start = time.perf_counter()
         try:
             text = pdf_bytes_to_text(pdf_file.read(), preserve_layout=True)
             results = parse_notes(text)
@@ -245,14 +200,6 @@ with tab1:
                     file_name="external_sessions_from_pdf.xlsx",
                 )
 
-                _pdf_elapsed = time.perf_counter() - _tab1_start
-                _log_timer(
-                    "Tab1: HiRasmus PDF parse + external session build",
-                    _pdf_elapsed,
-                    f"notes={len(ext_df)}",
-                )
-                st.caption(f"⏱️ PDF processing time: {_pdf_elapsed:.2f}s")
-
         except Exception as e:
             st.error(f"Error during PDF processing: {e}")
 
@@ -273,7 +220,6 @@ with tab2:
     if not sessions_file:
         st.info("Upload the HiRamsus Excel file to continue.")
         st.stop()
-    _tab2_total_start = time.perf_counter()
 
     external_sessions_df = st.session_state.get("external_sessions_df", None)
 
@@ -305,15 +251,8 @@ with tab2:
         use_time_adj_override=USE_TIME_ADJ_OVERRIDE,
     )
 
-    _sessions_load_start = time.perf_counter()
     df = pd.read_excel(sessions_file, dtype=object)
     df = normalize_cols(df)
-    _sessions_load_elapsed = time.perf_counter() - _sessions_load_start
-    _log_timer(
-        "Tab2: HiRasmus Excel upload + load",
-        _sessions_load_elapsed,
-        f"rows={len(df)}",
-    )
 
     if "Start date" not in df.columns and "Start Date" in df.columns:
         df = df.rename(columns={"Start Date": "Start date"})
@@ -359,7 +298,6 @@ with tab2:
 
     # ---- External session matching ----
     if external_sessions_df is not None:
-        _merge_start = time.perf_counter()
         ext_df = normalize_cols(external_sessions_df.copy())
 
         if ensure_cols(ext_df, ["Insurance ID", "Session Time"], "External Sessions File"):
@@ -582,14 +520,6 @@ with tab2:
 
             df_f["_PDF_Time_Accurate"] = df_f.apply(_pdf_time_matches_excel, axis=1)
 
-            _merge_elapsed = time.perf_counter() - _merge_start
-            _log_timer(
-                "Tab2: Session Checker merge + match compute",
-                _merge_elapsed,
-                f"sessions={len(df_f)}",
-            )
-            st.caption(f"⏱️ Session merge time: {_merge_elapsed:.2f}s")
-
         else:
             st.warning("External sessions data provided, but required columns are missing.")
 
@@ -598,7 +528,6 @@ with tab2:
     df_f["Email"] = ""
 
     if bt_contacts_file is not None:
-        _bt_start = time.perf_counter()
         bt_df = read_any(bt_contacts_file)
         if bt_df is not None:
             bt_df = normalize_cols(bt_df)
@@ -641,13 +570,6 @@ with tab2:
 
                 df_f["Phone"] = df_f["Staff Name"].map(staff_to_phone).fillna("")
                 df_f["Email"] = df_f["Staff Name"].map(staff_to_email).fillna("")
-                _bt_elapsed = time.perf_counter() - _bt_start
-                _log_timer(
-                    "Tab2: BT contacts upload + fuzzy match",
-                    _bt_elapsed,
-                    f"contacts={len(bt_df)}",
-                )
-                st.caption(f"⏱️ BT contacts mapping time: {_bt_elapsed:.2f}s")
 
     # ---- Zoho Case Coordinator merge ----
     df_f["Case Coordinator Name"] = ""
@@ -812,14 +734,6 @@ with tab2:
     st.session_state["session_checker_df"] = export_df.copy()
     st.session_state["session_checker_present_cols"] = present_cols
 
-    _tab2_total_elapsed = time.perf_counter() - _tab2_total_start
-    _log_timer(
-        "Tab2: Session Checker total response time",
-        _tab2_total_elapsed,
-        f"rows={len(export_df)}",
-    )
-    st.info(f"⏱️ Session Checker total time: {_tab2_total_elapsed:.2f}s")
-
     xlsx_all = export_excel(export_df[present_cols])
     xlsx_clean = export_excel(export_df[export_df["_OverallPass"]][present_cols])
     xlsx_flagged = export_excel(export_df[~export_df["_OverallPass"]][present_cols])
@@ -858,7 +772,6 @@ with tab3:
         )
 
         if billing_file is not None:
-            _tab3_start = time.perf_counter()
             try:
                 billing_df = read_any(billing_file)
             except Exception as e:
@@ -937,14 +850,6 @@ with tab3:
 - **No Match (no Appointment ID match):** {nomatch_count}
 """
                     )
-
-                    _tab3_elapsed = time.perf_counter() - _tab3_start
-                    _log_timer(
-                        "Tab3: Aloha upload + billed checker result",
-                        _tab3_elapsed,
-                        f"rows={len(merged)}",
-                    )
-                    st.info(f"⏱️ Billed Checker total time: {_tab3_elapsed:.2f}s")
 
                     summary_df = pd.DataFrame(
                         {
