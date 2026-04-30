@@ -179,7 +179,19 @@ def parse_notes(text: str):
         if pos == -1:
             pos = lower_block.find("individual present")
         if pos != -1:
-            present_text = block[pos: pos + 1500]
+            # Take up to 1500 chars as a hard cap, but stop at the next
+            # section header (a non-empty line ending with ":") so we don't
+            # bleed into the caregiver signature section or other fields.
+            window = block[pos: pos + 1500]
+            lines = window.splitlines()
+            kept = []
+            for i, line in enumerate(lines):
+                kept.append(line)
+                # After the first line (the label itself), stop as soon as we
+                # hit another section header
+                if i > 0 and line.strip().endswith(":") and line.strip() != ":":
+                    break
+            present_text = "\n".join(kept)
 
         # Slash variants: U+002F (standard), U+2215 (∕), U+2044 (⁄), U+FF0F (／)
         _SLASH = r"[\u002F\u2215\u2044\uFF0F]"
