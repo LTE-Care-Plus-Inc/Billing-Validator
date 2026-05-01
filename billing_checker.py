@@ -1,8 +1,12 @@
 # ===========================
 # app.py
 # ===========================
+import io
+import logging
 import re
+import time
 from difflib import SequenceMatcher
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -39,6 +43,101 @@ from validators import (
     get_failure_reasons,
     configure as configure_validators,
 )
+
+_LOG = logging.getLogger("billing_checker")
+if not _LOG.handlers:
+    _stderr = logging.StreamHandler()
+    _stderr.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
+    _LOG.addHandler(_stderr)
+_LOG.setLevel(logging.INFO)
+_LOG.propagate = False
+
+
+def _log_step(name: str, t0: float) -> None:
+    _LOG.info("%s: %.4f s", name, time.perf_counter() - t0)
+
+
+def _norm_bt_contact_key(s: str) -> str:
+    s = str(s).strip().lower()
+    s = s.replace(",", " ")
+    s = " ".join(s.split())
+    return s
+
+
+def _map_staff_to_contact_lookup(staff_series: pd.Series, contact_map: dict) -> pd.Series:
+    """Resolve phone/email using str keys from the BT cache (pandas cells may be numpy string scalars)."""
+    return staff_series.map(lambda x: contact_map.get(str(x), "") if pd.notna(x) else "")
+
+
+@st.cache_data(show_spinner=False)
+def _cached_bt_contact_maps(
+    bt_blob: bytes,
+    bt_filename: str,
+    staff_tuple: Tuple[str, ...],
+) -> Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[str, str], ...], Optional[str]]:
+    """Build staff→Phone/Email maps (SequenceMatcher ratio ≥ 0.8); same semantics as non-cached code.
+
+    Cached by BT file contents + normalized staff roster so Streamlit reruns need not redo O(n×m) work.
+    Returns ``(phone_item_pairs, email_item_pairs, error_or_none)``; caller wraps with dict(...).
+    """
+    buf = io.BytesIO(bt_blob)
+    buf.name = bt_filename
+    try:
+        bt_df = read_any(buf)
+    except Exception as e:
+        return (), (), f"BT Contacts file could not be read: {e}"
+
+    if bt_df is None:
+        return (), (), "BT Contacts file was empty."
+
+    bt_df = normalize_cols(bt_df)
+    bt_required = {"BT Name", "Phone", "Email"}
+    bt_missing = bt_required - set(bt_df.columns)
+    if bt_missing:
+        return (), (), f"BT Contacts file is missing: {sorted(bt_missing)}"
+
+    bt_df["BT_formatted"] = bt_df["BT Name"].apply(normalize_name)
+    bt_df["bt_norm"] = bt_df["BT_formatted"].apply(_norm_bt_contact_key)
+
+    exact_phone_by_norm = {}
+    exact_email_by_norm = {}
+    for bt_norm, phone, email in zip(
+        bt_df["bt_norm"],
+        bt_df["Phone"],
+        bt_df["Email"],
+    ):
+        if bt_norm not in exact_phone_by_norm:
+            exact_phone_by_norm[bt_norm] = "" if pd.isna(phone) else str(phone)
+            exact_email_by_norm[bt_norm] = "" if pd.isna(email) else str(email)
+
+    bt_entries = list(zip(bt_df["bt_norm"], bt_df["Phone"], bt_df["Email"]))
+
+    staff_to_phone = {}
+    staff_to_email = {}
+    for staff in staff_tuple:
+        staff_norm = _norm_bt_contact_key(staff)
+
+        if staff_norm in exact_phone_by_norm:
+            staff_to_phone[staff] = exact_phone_by_norm[staff_norm]
+            staff_to_email[staff] = exact_email_by_norm[staff_norm]
+            continue
+
+        best_score = 0.0
+        best_phone = ""
+        best_email = ""
+        for bt_name_norm, phone, email in bt_entries:
+            score = SequenceMatcher(None, staff_norm, bt_name_norm).ratio()
+            if score > best_score:
+                best_score = score
+                best_phone = "" if pd.isna(phone) else str(phone)
+                best_email = "" if pd.isna(email) else str(email)
+
+        if best_score >= 0.8:
+            staff_to_phone[staff] = best_phone
+            staff_to_email[staff] = best_email
+
+    return tuple(staff_to_phone.items()), tuple(staff_to_email.items()), None
+
 
 # -----------------------------
 # PAGE CONFIG
@@ -139,12 +238,16 @@ with tab1:
 
     if pdf_file is not None:
         try:
-            text = pdf_bytes_to_text(pdf_file.read(), preserve_layout=True)
+            _t = time.perf_counter()
+            _pdf_bytes = pdf_file.read()
+            text = pdf_bytes_to_text(_pdf_bytes, preserve_layout=True)
             results = parse_notes(text)
+            _log_step("tab1.pdf_read_text_extract_and_parse_notes", _t)
 
             if not results:
                 st.warning("No notes found in the PDF. Make sure it contains 'Client:' blocks.")
             else:
+                _t = time.perf_counter()
                 notes_df = pd.DataFrame(results)
                 st.success(f"Parsed {len(notes_df)} notes from PDF.")
 
@@ -158,7 +261,7 @@ with tab1:
                         "Compliance Errors",
                     ]
                     preview_cols = [c for c in preview_cols if c in notes_df.columns]
-                    st.dataframe(notes_df[preview_cols].head(120), use_container_width=True)
+                    st.dataframe(notes_df[preview_cols].head(120), width="stretch")
 
                 cols = [
                     "Client",
@@ -187,13 +290,23 @@ with tab1:
                 ext_df = ext_df[ext_df["Client"].notna()].copy()
 
                 st.session_state["external_sessions_df"] = ext_df
+                _log_step(
+                    "tab1.build_external_sessions_dataframe_normalize_and_store",
+                    _t,
+                )
+                _LOG.info(
+                    "tab1.done: external_sessions_df rows=%d (ready for Session Checker)",
+                    len(ext_df),
+                )
 
                 st.info(
                     f"Generated {len(ext_df)} external session rows. "
                     "These will be used automatically in the **Session Checker** tab."
                 )
 
+                _t = time.perf_counter()
                 ext_xlsx = notes_to_excel_bytes(ext_df.to_dict(orient="records"), sheet_name="External Sessions")
+                _log_step("tab1.build_download_xlsx_buffer", _t)
                 st.download_button(
                     "⬇️ Download External Session List (.xlsx)",
                     data=ext_xlsx,
@@ -236,7 +349,9 @@ with tab2:
             key="external_sessions_manual_only",
         )
         if manual_external_file is not None:
+            _t = time.perf_counter()
             external_sessions_df = read_any(manual_external_file)
+            _log_step("tab2.load_manual_external_sessions_file", _t)
 
     USE_TIME_ADJ_OVERRIDE = st.toggle(
         f"Use '{TIME_ADJ_COL}' as a signature override (only for sessions that failed signature timing; duration & daily limit still enforced)",
@@ -251,6 +366,8 @@ with tab2:
         use_time_adj_override=USE_TIME_ADJ_OVERRIDE,
     )
 
+    _tab2_pipeline_start = time.perf_counter()
+    _t = time.perf_counter()
     df = pd.read_excel(sessions_file, dtype=object)
     df = normalize_cols(df)
 
@@ -258,12 +375,17 @@ with tab2:
         df = df.rename(columns={"Start Date": "Start date"})
 
     if not ensure_cols(df, REQ_COLS, "Sessions File"):
+        _LOG.info("tab2.aborted: sessions file missing required columns")
         st.stop()
 
     if USE_TIME_ADJ_OVERRIDE:
         if not ensure_cols(df, [TIME_ADJ_COL], "Sessions File"):
+            _LOG.info("tab2.aborted: sessions file missing %s column", TIME_ADJ_COL)
             st.stop()
 
+    _log_step("tab2.read_sessions_excel_and_validate_columns", _t)
+
+    _t = time.perf_counter()
     df_f = df[
         (df["Status"].astype(str).str.strip().isin(STATUS_REQUIRED))
         & (df["Session"].astype(str).str.strip() == SESSION_REQUIRED)
@@ -295,6 +417,7 @@ with tab2:
         pd.to_datetime(df_f["End time"], errors="coerce")
         if "End time" in df_f.columns else pd.NaT
     )
+    _log_step("tab2.filter_rows_and_prepare_timestamps", _t)
 
     # ---- External session matching ----
     if external_sessions_df is not None:
@@ -319,6 +442,7 @@ with tab2:
             ] if c in ext_df.columns]
 
             # ── PRIMARY MERGE: Insurance ID + positional index ───────────────
+            _tp = time.perf_counter()
             ext_df["SessionIndex"] = ext_df.groupby("Client: Insurance ID").cumcount()
             df_f["SessionIndex"]   = df_f.groupby("Client: Insurance ID").cumcount()
 
@@ -365,6 +489,7 @@ with tab2:
                 ext_df.drop(columns=["_dob_norm", "_SIdx_DOB"], errors="ignore", inplace=True)
 
             df_f = df_f.sort_values("_RowOrder", kind="mergesort").reset_index(drop=True)
+            _log_step("tab2.merge_external_sessions_pandas_joins", _tp)
 
             # ---- MERGE DEBUGGING ----
             with st.expander("🔍 Merge Debug", expanded=True):
@@ -390,15 +515,16 @@ with tab2:
                     "Client Name", "Client: Insurance ID", "SessionIndex", "Date"
                 ]].head(20)
                 st.write("**Still-unmatched rows (first 20):**")
-                st.dataframe(unmatched_df, use_container_width=True)
+                st.dataframe(unmatched_df, width="stretch")
 
                 matched_df = _df_debug[_df_debug["Session Time"].notna()][[
                     "Client Name", "Client: Insurance ID", "SessionIndex", "Date", "Session Time"
                 ]].head(20)
                 st.write("**Matched rows (first 20):**")
-                st.dataframe(matched_df, use_container_width=True)
+                st.dataframe(matched_df, width="stretch")
             # ---- END MERGE DEBUGGING ----
 
+            _td = time.perf_counter()
             for src, dst in [
                 ("Present_Client", "_Note_ClientPresent"),
                 ("Present_ParentCaregiver", "_Note_ParentPresent"),
@@ -520,61 +646,50 @@ with tab2:
 
             df_f["_PDF_Time_Accurate"] = df_f.apply(_pdf_time_matches_excel, axis=1)
 
+            _log_step("tab2.merge_external_sessions_derived_times_and_checks", _td)
+
         else:
             st.warning("External sessions data provided, but required columns are missing.")
+            _LOG.info(
+                "tab2.merge_external_sessions: skipped (external data missing Insurance ID or Session Time)"
+            )
+
+    else:
+        _LOG.info(
+            "tab2.merge_external_sessions: skipped (no external_sessions_df in session state)"
+        )
 
     # ---- BT contacts ----
     df_f["Phone"] = ""
     df_f["Email"] = ""
 
     if bt_contacts_file is not None:
-        bt_df = read_any(bt_contacts_file)
-        if bt_df is not None:
-            bt_df = normalize_cols(bt_df)
-
-            bt_required = {"BT Name", "Phone", "Email"}
-            bt_missing = bt_required - set(bt_df.columns)
-            if bt_missing:
-                st.error(f"BT Contacts file is missing: {sorted(bt_missing)}")
-            else:
-                bt_df["BT_formatted"] = bt_df["BT Name"].apply(normalize_name)
-
-                def norm_name(s: str) -> str:
-                    s = str(s).strip().lower()
-                    s = s.replace(",", " ")
-                    s = " ".join(s.split())
-                    return s
-
-                bt_df["bt_norm"] = bt_df["BT_formatted"].apply(norm_name)
-
-                staff_to_phone = {}
-                staff_to_email = {}
-
-                staff_unique = df_f["Staff Name"].dropna().unique()
-
-                for staff in staff_unique:
-                    staff_norm = norm_name(staff)
-                    best_score = 0.0
-                    best_row = None
-
-                    for _, bt_row in bt_df.iterrows():
-                        bt_name_norm = bt_row["bt_norm"]
-                        score = SequenceMatcher(None, staff_norm, bt_name_norm).ratio()
-                        if score > best_score:
-                            best_score = score
-                            best_row = bt_row
-
-                    if best_row is not None and best_score >= 0.8:
-                        staff_to_phone[staff] = best_row.get("Phone", "")
-                        staff_to_email[staff] = best_row.get("Email", "")
-
-                df_f["Phone"] = df_f["Staff Name"].map(staff_to_phone).fillna("")
-                df_f["Email"] = df_f["Staff Name"].map(staff_to_email).fillna("")
+        _t = time.perf_counter()
+        _bt_blob = bt_contacts_file.getvalue()
+        _staff_tuple = tuple(
+            str(s) for s in df_f["Staff Name"].dropna().unique()
+        )
+        _phone_pairs, _email_pairs, _bt_err = _cached_bt_contact_maps(
+            _bt_blob,
+            bt_contacts_file.name or "contacts.csv",
+            _staff_tuple,
+        )
+        if _bt_err is not None:
+            st.error(_bt_err)
+        else:
+            _pmap = dict(_phone_pairs)
+            _emap = dict(_email_pairs)
+            df_f["Phone"] = _map_staff_to_contact_lookup(df_f["Staff Name"], _pmap)
+            df_f["Email"] = _map_staff_to_contact_lookup(df_f["Staff Name"], _emap)
+        _log_step("tab2.bt_contacts_lookup", _t)
+    else:
+        _LOG.info("tab2.bt_contacts_lookup: skipped (no BT contacts file)")
 
     # ---- Zoho Case Coordinator merge ----
     df_f["Case Coordinator Name"] = ""
 
     if zoho_file is not None:
+        _t = time.perf_counter()
         zoho_df = read_any(zoho_file)
         if zoho_df is not None:
             zoho_df = normalize_cols(zoho_df)
@@ -628,6 +743,11 @@ with tab2:
                 matched_count = (df_f["Case Coordinator Name"] != "").sum()
                 st.success(f"Zoho match: {matched_count} of {len(df_f)} sessions matched a Case Coordinator.")
 
+        _log_step("tab2.zoho_case_coordinator_lookup", _t)
+    else:
+        _LOG.info("tab2.zoho_case_coordinator_lookup: skipped (no Zoho file)")
+
+    _t = time.perf_counter()
     df_f["Daily Minutes"] = df_f.groupby(["Staff Name", "Date"])["Actual Minutes"].transform("sum")
     df_f["Daily Session Count"] = df_f.groupby(["Client Name", "Date", "Session"])["Session"].transform("count")
 
@@ -653,6 +773,7 @@ with tab2:
                         df_f.at[idx, "_SessionGapMinutes"] = gap_minutes
                     if gap_minutes < MIN_SESSION_GAP_MINUTES:
                         df_f.at[idx, "_SessionGapOk"] = False
+    _log_step("tab2.daily_aggregates_and_gap_tracking", _t)
 
     # Expose _PDF_Time_Accurate as a readable display column
     if "_PDF_Time_Accurate" in df_f.columns:
@@ -660,6 +781,7 @@ with tab2:
             {True: "✅ Match", False: "❌ Mismatch", np.nan: "—"}
         ).fillna("—")
 
+    _t = time.perf_counter()
     eval_results = df_f.apply(evaluate_row, axis=1, result_type="expand")
     df_f["_DurationOk"] = eval_results["duration_ok"]
     df_f["_SigOk"] = eval_results["sig_ok"]
@@ -671,9 +793,13 @@ with tab2:
     df_f["_PdfTimeOk"] = eval_results["pdf_time_ok"]
     df_f["_GapOk"] = eval_results["gap_ok"]
     df_f["_OverallPass"] = eval_results["overall_pass"]
+    _log_step("tab2.validators_evaluate_row", _t)
 
+    _t = time.perf_counter()
     df_f["Failure Reasons"] = df_f.apply(get_failure_reasons, axis=1)
+    _log_step("tab2.failure_reasons_apply", _t)
 
+    _t = time.perf_counter()
     for col in ["Adult Caregiver signature time"]:
         if col in df_f.columns:
             df_f[col] = (
@@ -682,6 +808,7 @@ with tab2:
                 .dt.strftime("%m/%d/%Y %I:%M:%S %p")
                 .fillna("")
             )
+    _log_step("tab2.format_signature_columns", _t)
 
     display_cols = [
         "AlohaABA Appointment ID",
@@ -718,7 +845,7 @@ with tab2:
 
     st.subheader("2) Results")
     with st.expander("Summary", expanded=False):
-        st.dataframe(export_df[present_cols], use_container_width=True, height=560)
+        st.dataframe(export_df[present_cols], width="stretch", height=560)
 
     st.caption("Summary")
     summary = pd.DataFrame(
@@ -730,13 +857,26 @@ with tab2:
     )
     st.table(summary)
 
-
+    _t = time.perf_counter()
     st.session_state["session_checker_df"] = export_df.copy()
     st.session_state["session_checker_present_cols"] = present_cols
+    _LOG.info(
+        "tab2.checkpoint: session_checker_df stored — %d rows (Aloha file can be uploaded)",
+        len(export_df),
+    )
+    _log_step("tab2.persist_session_state_for_billed_checker", _t)
 
+    _t = time.perf_counter()
     xlsx_all = export_excel(export_df[present_cols])
     xlsx_clean = export_excel(export_df[export_df["_OverallPass"]][present_cols])
     xlsx_flagged = export_excel(export_df[~export_df["_OverallPass"]][present_cols])
+    _log_step("tab2.build_three_download_xlsx_buffers", _t)
+
+    _LOG.info(
+        "tab2.done: full Session Checker rerun — total_wall=%.4f s — rows exported=%d",
+        time.perf_counter() - _tab2_pipeline_start,
+        len(export_df),
+    )
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -772,14 +912,17 @@ with tab3:
         )
 
         if billing_file is not None:
+            _t = time.perf_counter()
             try:
                 billing_df = read_any(billing_file)
             except Exception as e:
                 billing_df = None
                 st.error(f"Error reading billing status file: {e}")
+                _LOG.info("tab3.read_billing_upload: failed (%s)", e)
 
             if billing_df is not None:
                 billing_df = normalize_cols(billing_df)
+                _log_step("tab3.read_and_normalize_billing_file", _t)
 
                 if not all(c in billing_df.columns for c in ["Appointment ID", "Date Billed", "Completed"]):
                     st.error("Billing status file must contain columns: 'Appointment ID', 'Date Billed', and 'Completed'.")
@@ -789,6 +932,7 @@ with tab3:
                         "Please ensure the HiRasmus export includes this column."
                     )
                 else:
+                    _t = time.perf_counter()
                     merged = base_df.merge(
                         billing_df[["Appointment ID", "Date Billed", "Completed"]],
                         left_on="AlohaABA Appointment ID",
@@ -811,6 +955,7 @@ with tab3:
                         return "Unbilled"
 
                     merged["Billing Status"] = merged.apply(classify_status, axis=1)
+                    _log_step("tab3.merge_aloha_billing_and_classify_status", _t)
 
                     # Flag passed sessions where Aloha shows not completed
                     not_completed_mask = (
@@ -867,11 +1012,17 @@ with tab3:
                         if c in merged.columns
                     ]
 
+                    _t = time.perf_counter()
                     xlsx_all = export_excel(all_df[dl_cols])
                     xlsx_billed = export_excel(billed_df[dl_cols])
                     xlsx_unbilled_clean = export_excel(unbilled_clean_df[dl_cols])
                     xlsx_unbilled_flagged = export_excel(unbilled_flagged_df[dl_cols])
                     xlsx_nomatch = export_excel(nomatch_df[dl_cols])
+                    _log_step("tab3.build_five_download_xlsx_buffers", _t)
+                    _LOG.info(
+                        "tab3.done: billed checker complete — %d sessions in merged view",
+                        total_sessions,
+                    )
 
                     c1, c2, c3, c4, c5 = st.columns(5)
                     with c1:
